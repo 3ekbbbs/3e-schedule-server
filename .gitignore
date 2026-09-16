@@ -1,0 +1,35 @@
+# 运行期数据 —— 绝对不要提交。
+# 里面有真实账号、密码哈希、日程内容和会话令牌。
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# 证书与私钥。server.key / ca.key 泄漏 = 任何人都能冒充你的服务器。
+certs/
+*.crt
+*.key
+*.pem
+
+# 部署令牌（网页端的 /-/deploy 用它鉴权）
+deploy-token.txt
+
+# 编译产物
+/3e-schedule-server
+/3e-schedule-server.exe
+*.exe
+*.test
+/cmd/mkcert/mkcert
+/cmd/rrulecheck/rrulecheck
+
+# 本地配置 / 密钥
+.env
+*.local
+settings.json
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

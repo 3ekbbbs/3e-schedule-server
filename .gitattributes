@@ -1,0 +1,12 @@
+# 统一换行符为 LF。Windows 上默认会把检出的文件转成 CRLF，
+# 那样同一份代码在不同机器上 diff 会到处是假改动。
+* text=auto eol=lf
+
+# 确认真是二进制的文件（避免 git 误判）
+*.png binary
+*.ico binary
+*.jpg binary
+*.pdf binary
+
+# 生成物 / 锁文件不参与 diff 统计
+go.sum -diff linguist-generated
