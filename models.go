@@ -104,6 +104,41 @@ type Snooze struct {
 	DeletedAt     *int64 `json:"deleted_at"`
 }
 
+// InboxItem 收件箱条目（2026-09-19）。
+//
+// **唯一一个"以用户为中心"的实体** —— 可见性是 `user_id == 自己`，
+// 不按日历权限。所以它**不进任何 ACL 判定**，只做归属判定。
+//
+// ⚠️ `RemindMinutesBefore` 是 **JSON 数组文本**，不是 []int64。
+// 原因：列要对齐 `remind_minutes_before TEXT DEFAULT '[]'`，
+// 而且**空数组 = 不提醒**是有意义的（红线 18）—— 序列化成 `[]` 原样带出去，
+// **不要**在 Go 侧解包再 `omitempty`，否则客户端读到 undefined，
+// 又会退回"默认提前 15 分钟"的老毛病。
+type InboxItem struct {
+	ID                  string  `json:"id"`
+	UserID              string  `json:"user_id"`
+	Kind                string  `json:"kind"`   // 'share' | 'capture'
+	Status              string  `json:"status"` // 'pending' | 'accepted' | 'dismissed'
+	Source              string  `json:"source"`
+	FromUserID          string  `json:"from_user_id"`
+	FromName            string  `json:"from_name"`
+	OriginCalendarID    string  `json:"origin_calendar_id"`
+	Title               string  `json:"title"`
+	Notes               string  `json:"notes"`
+	Location            string  `json:"location"`
+	AllDay              bool    `json:"all_day"`
+	DTStartUTC          int64   `json:"dtstart_utc"`
+	DurationSec         int64   `json:"duration_sec"`
+	RemindMinutesBefore string  `json:"remind_minutes_before"`
+	SourceExcerpt       string  `json:"source_excerpt"`
+	Confidence          string  `json:"confidence"`
+	AcceptedEventID     string  `json:"accepted_event_id"`
+	CreatedAt           int64   `json:"created_at"`
+	DecidedAt           int64   `json:"decided_at"`
+	Seq                 int64   `json:"seq"`
+	FieldSeqs           jsonMap `json:"field_seqs,omitempty"`
+}
+
 type Conflict struct {
 	ID           string  `json:"id"`
 	Entity       string  `json:"entity"`
@@ -133,6 +168,19 @@ const (
 )
 
 var eventFieldKinds = map[string]string{
+	// ★ 2026-09-28：换日历（把一条日程从日历 1 挪到日历 2）。
+	//
+	// 用户报「编辑日程时切换日历，手机端依旧失效」—— 根因就在这里：
+	// 这个白名单原本**没有** calendar_id，客户端 PUT 上来的值会被
+	// applyFieldMerge 里那句 `if !ok { continue }` 静默跳过，接口照样返回
+	// 200、且响应里的 event.calendar_id 原封不动 —— 连个错都报不出来。
+	//
+	// 三端（手机 / 电脑 / 网页）都在 body 里发 calendar_id，所以这不是
+	// "手机端的问题"，是**三端一起坏**，只是先从手机上被发现。
+	//
+	// 放进白名单 = 它成为**参与字段级合并的共享字段**：两个人同时把同一条
+	// 日程挪到不同的日历，会正常报冲突，而不是谁后写谁赢。
+	"calendar_id":  kindText,
 	"title":        kindText,
 	"notes":        kindText,
 	"location":     kindText,
@@ -157,6 +205,14 @@ func kindMapFor(entity string) map[string]string {
 	if entity == "calendar" {
 		return calendarFieldKinds
 	}
+	// 收件箱**故意没有可合并字段**。
+	// 它是 per-user 的私有行，没有"两个人同时改同一条"的场景，
+	// 所以不需要冲突合并 —— 但它仍然要占 sync_log 的 seq（否则客户端永远拉不到）。
+	// 返回空表而不是事件字段表：万一有人把 inbox 喂进合并路径，
+	// 空表会让它「什么都不改」而不是「按事件的字段名乱改」。
+	if entity == "inbox" {
+		return map[string]string{}
+	}
 	return eventFieldKinds
 }
 
@@ -168,6 +224,8 @@ func tableFor(entity string) string {
 		return "calendars"
 	case "snooze":
 		return "snoozes"
+	case "inbox":
+		return "inbox_items"
 	default:
 		return "events"
 	}

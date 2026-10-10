@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -261,7 +263,15 @@ type syncPayload struct {
 	Instances []Instance `json:"instances"`
 	Snoozes   []Snooze   `json:"snoozes"`
 	Conflicts []Conflict `json:"conflicts"`
-	Users     []User     `json:"users,omitempty"`
+	// Inbox 收件箱（2026-09-19 新增，per-user）。
+	//
+	// ⚠️ **向后兼容的关键**：这是**新增的 JSON 键**，不是改已有键。
+	// 服务端会先于客户端上线，届时一定有旧客户端在跑 ——
+	// 旧客户端只读它认识的键，多出来一个 `inbox` 不影响它。
+	// **不要**把 inbox 混进 events/instances，那才真会让旧客户端解析出错误数据。
+	// （各端仍需确认 `parsePayload` 遇到未知 entity 是"忽略"而非"整包丢弃"。）
+	Inbox []InboxItem `json:"inbox"`
+	Users []User      `json:"users,omitempty"`
 }
 
 func (s *Server) handleSyncChanges(w http.ResponseWriter, r *http.Request) {
@@ -277,6 +287,30 @@ func (s *Server) handleSyncChanges(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, 500, err.Error())
 		return
 	}
+
+	// ★ 2026-09-28：把 `maintenance`（整库修复）这个信号**显式下发**。
+	//
+	// 原来只是往 sync_log 里写一条 entity='maintenance' 的记录，
+	// 指望客户端"看到不认识的 entity 就整份重拉" —— 但 `loadEntities` 的
+	// switch 根本不认识它，于是这条记录**在响应里什么都不产生**，
+	// 客户端只看到 last_seq 往前走了一点点，**永远不知道库被修过**。
+	//
+	// 这就是用户报的「那个不存在日历的日程没有删干净，或者说没有正常同步」：
+	// 服务端当时确实修好了，但没有任何一个客户端收到"请重拉"的通知。
+	//
+	// 现在明确给出 `"maintenance": true`，客户端收到就**丢弃本地游标、
+	// 下一轮做一次全量快照**（快照是"以服务端为准"的替换，能洗掉本地残渣）。
+	maintenance := false
+	filtered := make([]changeRef, 0, len(refs))
+	for _, ref := range refs {
+		if ref.entity == "maintenance" {
+			maintenance = true
+			continue
+		}
+		filtered = append(filtered, ref)
+	}
+	refs = filtered
+
 	payload, err := s.loadEntities(uid, refs)
 	if err != nil {
 		apiErr(w, 500, err.Error())
@@ -288,8 +322,11 @@ func (s *Server) handleSyncChanges(w http.ResponseWriter, r *http.Request) {
 		"instances": payload.Instances,
 		"snoozes":   payload.Snoozes,
 		"conflicts": payload.Conflicts,
+		"inbox":     payload.Inbox,
 		"last_seq":  last,
 		"has_more":  hasMore,
+		// 客户端据此决定"这轮之后要整份重拉"
+		"maintenance": maintenance,
 	})
 }
 
@@ -322,6 +359,7 @@ func (s *Server) handleSyncSnapshot(w http.ResponseWriter, r *http.Request) {
 		"instances": payload.Instances,
 		"snoozes":   payload.Snoozes,
 		"conflicts": payload.Conflicts,
+		"inbox":     payload.Inbox,
 		"users":     users,
 		"last_seq":  last,
 	})
@@ -345,13 +383,67 @@ func (s *Server) allUsers() ([]User, error) {
 	return out, nil
 }
 
+// tombstoneEvent / tombstoneInstance 造一条"只带身份、不带内容"的墓碑。
+//
+// ★ 2026-09-28 新增，解决"换日历之后，原日历的人本地永远清不掉"。
+//
+// 背景：客户端的同步是**按 seq 增量 upsert**，从不自己判断删除 —— 它只认
+// 服务端下发的 deleted_at。"日程从日历 1 挪到日历 2"对**留在日历 1 的人**
+// 来说，等价于"这条我没资格看了"；而 loadEntities 原来的写法是直接
+// `continue`，一个字节都不下发 → 他们本地那条**永远不会消失**，界面上
+// 留下一个点不开、也删不掉的幽灵条目。
+//
+// ⚠️ 客户端的 pruneOrphans() 救不了这个场景（本以为它可以）：本地残留行的
+// `calendar_id` 仍是**日历 1 —— 一个完全合法、仍在集合里的日历**，
+// "不在我的日历集合里"这个清理条件根本不成立。只有服务端主动说
+// "这条没了"才行。
+//
+// ⚠️ 墓碑里**只许有 id / calendar_id / seq / deleted_at + 一个空 reminders**，
+// 绝不能捎带 title、notes、location 这些内容字段：它是发给"已经无权看这条
+// 日程的人"的，带上内容就等于顺着同步流把私有日程原文泄露出去。
+//
+// 客户端那边是 CONFLICT_REPLACE 写入，deleted_at 非空 → 所有查询
+// （都带 `deleted_at IS NULL`）都看不到它，正好达到"删掉"的效果。
+func tombstoneEvent(ev Event) Event {
+	deleted := ev.UpdatedAt
+	if deleted == 0 {
+		deleted = time.Now().Unix()
+	}
+	return Event{
+		ID:         ev.ID,
+		CalendarID: ev.CalendarID,
+		// 空数组而不是 nil：reminders 没有 omitempty，nil 会序列化成
+		// `"reminders": null`，客户端解析 null 的路径没必要去趟。
+		Reminders: []Reminder{},
+		DeletedAt: &deleted,
+		Seq:       ev.Seq,
+	}
+}
+
+func tombstoneInstance(in Instance) Instance {
+	deleted := time.Now().Unix()
+	return Instance{
+		ID:            in.ID,
+		EventID:       in.EventID,
+		OccurrenceKey: in.OccurrenceKey,
+		CalendarID:    in.CalendarID,
+		DeletedAt:     &deleted,
+		Seq:           in.Seq,
+	}
+}
+
 // loadEntities hydrates the change references, dropping anything the caller
 // may not see. The cursor still advances past those, otherwise one member
 // leaving a calendar would wedge everyone else's sync forever.
+//
+// ⚠️ 但"丢弃"只对**从来看不见**的东西成立。对"本来能看、现在看不见"的
+// （换日历 / 被移出成员 / 日历被删），必须下发墓碑而不是 continue ——
+// 原因见 tombstoneEvent 上面那段。
 func (s *Server) loadEntities(uid string, refs []changeRef) (*syncPayload, error) {
-	p := &syncPayload{Calendars: []Calendar{}, Events: []Event{}, Instances: []Instance{}, Snoozes: []Snooze{}, Conflicts: []Conflict{}}
+	p := &syncPayload{Calendars: []Calendar{}, Events: []Event{}, Instances: []Instance{}, Snoozes: []Snooze{}, Conflicts: []Conflict{}, Inbox: []InboxItem{}}
 	seenCal := map[string]bool{}
 	seenEv := map[string]bool{}
+	seenInbox := map[string]bool{}
 
 	for _, ref := range refs {
 		switch ref.entity {
@@ -375,6 +467,9 @@ func (s *Server) loadEntities(uid string, refs []changeRef) (*syncPayload, error
 				continue
 			}
 			if _, ok := s.calendarRole(ev.CalendarID, uid); !ok {
+				// ★ 从"能看"变成"不能看"（最典型的就是换日历）→ 下发墓碑。
+				// 这里不能用 continue，否则客户端那份永远删不掉。
+				p.Events = append(p.Events, tombstoneEvent(*ev))
 				continue
 			}
 			p.Events = append(p.Events, *ev)
@@ -384,6 +479,7 @@ func (s *Server) loadEntities(uid string, refs []changeRef) (*syncPayload, error
 				continue
 			}
 			if _, ok := s.calendarRole(inst.CalendarID, uid); !ok {
+				p.Instances = append(p.Instances, tombstoneInstance(*inst))
 				continue
 			}
 			p.Instances = append(p.Instances, *inst)
@@ -396,6 +492,29 @@ func (s *Server) loadEntities(uid string, refs []changeRef) (*syncPayload, error
 				continue
 			}
 			p.Snoozes = append(p.Snoozes, *sn)
+		case "inbox":
+			// ★ 越权过滤就靠这一句。
+			//
+			// 收件箱是**唯一不按日历权限**判定的实体：可见性 = 这行归不归我。
+			// 所以这里**绝不能**用 canRead/calendarRole —— 那套是按日历算的，
+			// 而一条 share 收件箱的 origin_calendar_id 可能指向一张我根本没权限的日历
+			// （发件人的日历）。用日历权限去滤，结果是"要么看不到该看的、
+			// 要么把发件人日历的内容漏给不该看的人"。
+			//
+			// 闸门 scripts/inbox-gate.cjs 里有专门的越权用例：
+			// A 的 token 拉不到 B 的任何一行。
+			if seenInbox[ref.id] {
+				continue
+			}
+			seenInbox[ref.id] = true
+			it, ok := s.inboxByID(ref.id)
+			if !ok {
+				continue
+			}
+			if it.UserID != uid {
+				continue
+			}
+			p.Inbox = append(p.Inbox, *it)
 		}
 	}
 	cf, err := s.conflictsFor(uid, false)
@@ -473,9 +592,188 @@ type opPre struct {
 	denied   bool
 	calID    string
 	role     string
+	// banned 表示"内容含违禁词，被拦下"。与 denied 分开是因为**错误文案不同**：
+	// denied = "没权限"，banned = "内容违规"。混成一个错误码的话，用户看到
+	// "forbidden" 会以为是自己没权限，去翻权限设置，永远找不到真正的原因。
+	// 另外 banned 要能带上"中了哪个词"，所以 extra 一起传。
+	banned    bool
+	bannedHit *WordHit
+	bannedFld string
+	// aiRisk 表示"命中的是风险词（severity=3），需要 AI 复核才能定性"。
+	//
+	// ⚠️ 它**不是**一个"已拒绝"标记 —— preflight 只负责标出来，
+	// AI 调用由 handleSyncPush 在真正要决断时做一次（理由见 preflight 的注释）。
+	// 单独一个字段而不是复用 banned：两者的处理时机、错误码、文案都不一样，
+	// 混在一起就会出现"到底调没调过 AI"这种要靠读代码才说得清的问题。
+	aiRisk  bool
+	riskHit *WordHit
+	riskFld string
 }
 
+// pushOpFields 取出**本次要写入**的文本字段（字段名 → 内容）。
+//
+// ★ 抽成独立函数是有意的：词表匹配（逐字段）与 AI 送审（拼成一段）
+// 必须看**同一份字段清单**。以前这段 switch 内联在 moderatePushOp 里，
+// 加 AI 那一路时如果各抄一份，将来新增实体/字段必然只改一处 ——
+// 而漏掉的那一路是"静默不检查"，没有任何报错。
+//
+// 语义是 patch：只有 op.Data 里出现的字段才算本次写入。
+// 日历名同理（不传 name 表示不改名）。
+func pushOpFields(op pushOp) map[string]string {
+	fields := map[string]string{}
+	switch op.Entity {
+	case "event":
+		if v, ok := op.Data["title"]; ok {
+			fields["标题"] = anyToString(v)
+		}
+		if v, ok := op.Data["notes"]; ok {
+			fields["备注"] = anyToString(v)
+		}
+		if v, ok := op.Data["location"]; ok {
+			fields["地点"] = anyToString(v)
+		}
+	case "calendar":
+		if v, ok := op.Data["name"]; ok {
+			fields["日历名称"] = anyToString(v)
+		}
+	case "inbox":
+		// 收件箱同样要查：它是"AI 提案 → 加入日历"的中转，也是第二条进内容的路径
+		if v, ok := op.Data["title"]; ok {
+			fields["标题"] = anyToString(v)
+		}
+		if v, ok := op.Data["notes"]; ok {
+			fields["备注"] = anyToString(v)
+		}
+	}
+	return fields
+}
+
+// moderatePushOp 检查一次同步推送的内容是否含违禁词。
+//
+// ★ 为什么必须在**同步通道**上拦：客户端（尤其安卓/手表）日常改日程走的是
+// POST /api/sync/push，而不是 REST 的 /api/events。只在 REST 那几处加闸门，
+// 等于**主路径根本没审核**，那些客户端可以随便写违规内容。
+//
+// 这里的看点是"这次要写入哪些字段"：只有 op.Data 里出现的字段才检查
+// （patch 语义 = 没出现的字段不动）。日历名同理。
+//
+// ⚠️ 返回的 WordHit 可能是 sevBlock 也可能是 sevRisk —— 这是**调用方**
+// （preflight）按 severity 分流的事，本函数不替它决定。
+func (s *Server) moderatePushOp(op pushOp) (*WordHit, string) {
+	if s.words == nil || op.Op == "delete" {
+		return nil, ""
+	}
+	fields := pushOpFields(op)
+	if len(fields) == 0 {
+		return nil, ""
+	}
+	return s.moderateText(fields)
+}
+
+// pushOpText 把一条 pushOp 里**本次要写入**的文本字段拼成送审文本。
+//
+// 与 moderatePushOp 的区别：那个是"逐字段单独查词表"（词表匹配是以字段为
+// 单位的），这个是"合起来给 AI 看"（AI 需要上下文才能判语义）。
+// 两件事用同一份字段清单是对的 —— 抄一份新的必然有一天漏了某个字段。
+func pushOpText(op pushOp) string {
+	fields := pushOpFields(op)
+	if len(fields) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, k := range sortedFieldKeys(fields) {
+		v := strings.TrimSpace(fields[k])
+		if v == "" {
+			continue
+		}
+		sb.WriteString(k + "：" + v + "\n")
+	}
+	return sb.String()
+}
+
+// gateAIRisk 对一条命中了风险词的 pushOp 做 AI 复核。
+//
+// 返回 (给人看的理由, 是否拦下)。**语义与 moderation.go 的 gateByAI 对齐**：
+// AI 判违规才拦，其余所有情况（判合规 / 没启用 / 超时 / 出错）一律放行。
+//
+// ⚠️ 这里同样要写审计 —— 而且是**判合规的更要写**：
+// 风险词这一档的意义就是"我不确定，交给 AI"，那 AI 放过去的那些
+// 正是最该被人工复查的。
+func (s *Server) gateAIRisk(uid string, op pushOp, pre opPre) (string, bool) {
+	text := pushOpText(op)
+	if strings.TrimSpace(text) == "" {
+		return "", false
+	}
+	hits := []WordHit{}
+	if pre.riskHit != nil {
+		hits = append(hits, *pre.riskHit)
+	}
+
+	// 同步通道没有 http.Request 的 context（这里是事务中间），
+	// 用 Background + aiReviewText 内部的超时控制。这与 REST 路径的
+	// 超时语义一致：都是 aiConfig.Timeout 说了算。
+	verdict := s.aiReviewText(context.Background(), text, hits)
+	s.logModerationAudit(uid, s.userNameOf(uid), pre.riskFld, text, hits, verdict)
+
+	if !verdict.violated() {
+		return "", false
+	}
+	w := ""
+	if pre.riskHit != nil {
+		w = pre.riskHit.Raw
+	}
+	reason := "「" + pre.riskFld + "」被判定为违规内容（" +
+		wordCategoryLabel(verdict.Category) + "）"
+	if w != "" {
+		reason = "「" + pre.riskFld + "」含风险词「" + w + "」，且" +
+			"被判定为违规内容（" + wordCategoryLabel(verdict.Category) + "）"
+	}
+	if verdict.Reason != "" {
+		reason += "。理由：" + verdict.Reason
+	}
+	return reason, true
+}
+
+// anyToString 把 jsonMap 里的值按字符串处理。非字符串（nil/数字/布尔）一律给空串 ——
+// 内容检查只关心文本字段，别的类型不该被当成文本去匹配词库。
+func anyToString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case nil:
+		return ""
+	default:
+		return ""
+	}
+}
+
+// preflight 检查一次推送该不该被允许。
+//
+// ⚠️ 违禁词也在这里拦（见下面每个 case 开头的判定）。放在 preflight 而不是
+// 各个 pushXxx 里的理由：**preflight 是所有实体的必经之路**，新加实体时
+// 只要它还在 preflight 里判权限，审核就自动跟着生效 —— 少一个"忘了加"的坑。
+//
+// ⚠️ 三档 severity 在这里的处理（2026-09-23 加第 3 档后）：
+//   - severity 2 直接拦（banned）
+//   - severity 3 风险词 → 转 AI 复核（aiRisk），**判定不在这里做**
+//   - severity 1 放行
+//
+// 为什么把 AI 调用留给**调用方**做，而不是就地在这里调：
+// preflight 是**纯函数语义**（只看数据、不改状态、不做 IO），
+// 它会在一次 push 里被反复调用（"先探一遍、再逐条推"就是两次）。
+// 在这里发起网络请求会让同一条内容被送审两次 —— 多花钱、还让审计表里
+// 出现成对的重复记录。所以它只**标出"这条需要 AI 看"**，
+// 由 handleSyncPush 在真正要拦的那一刻调一次（见那边的 gateAIRisk）。
 func (s *Server) preflight(uid string, op pushOp) opPre {
+	// 违禁词对所有"写"操作生效。放在 switch 之前，覆盖全部实体。
+	if hit, fld := s.moderatePushOp(op); hit != nil {
+		switch {
+		case hit.Severity >= sevBlock:
+			return opPre{banned: true, bannedHit: hit, bannedFld: fld}
+		case hit.Severity >= sevRisk:
+			return opPre{aiRisk: true, riskHit: hit, riskFld: fld}
+		}
+	}
 	switch op.Entity {
 	case "calendar":
 		role, ok := s.calendarRole(op.ID, uid)
@@ -521,6 +819,32 @@ func (s *Server) preflight(uid string, op pushOp) opPre {
 			return opPre{denied: true}
 		}
 		return opPre{calID: ev.CalendarID}
+
+	case "inbox":
+		// 收件箱**不看日历权限**，只看归属（见 loadEntities 里那段注释）。
+		//
+		// 规则：
+		//   · 已有行 → 必须归我，否则拒绝
+		//   · 新行   → user_id 要么留空（服务端填成我），要么就是我；填别人一律拒绝
+		//
+		// 这一条同时挡住了两种越权：
+		// ① 直接改/删别人的收件箱条目；
+		// ② 用 capture 通道往别人收件箱里塞东西
+		//    （契约里 capture 的语义是"本机抓取同步上来"，不是"给别人发"）。
+		if it, ok := s.inboxByID(op.ID); ok {
+			if it.UserID != uid {
+				return opPre{denied: true}
+			}
+			return opPre{}
+		}
+		if op.Op == "delete" {
+			// 行不存在，删它没有意义，也不算越权
+			return opPre{notFound: true}
+		}
+		if owner := op.Data.stringOf("user_id"); owner != "" && owner != uid {
+			return opPre{denied: true}
+		}
+		return opPre{notFound: true}
 	}
 	return opPre{denied: true}
 }
@@ -549,6 +873,38 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 			errs = append(errs, op.Entity+" "+op.ID+": forbidden")
 			continue
 		}
+		if pre.banned {
+			// 违禁词：给一条**能读懂**的错误，并说清是哪个字段、哪个词。
+			// 与 forbidden 分开报，否则用户会去查权限设置（见 opPre.banned 的注释）。
+			//
+			// ⚠️ 这里只是**拒绝这一条 op**，不是拒绝整个批次 ——
+			// 一个批次里可能同时有"改个时间"和"改标题"，前者合法，不该被后者连坐。
+			w := ""
+			label := ""
+			if pre.bannedHit != nil {
+				w = pre.bannedHit.Raw
+				label = wordCategoryLabel(pre.bannedHit.Category)
+			}
+			errs = append(errs, op.Entity+" "+op.ID+": banned_word:「"+
+				pre.bannedFld+"」含违规词「"+w+"」（"+label+"）")
+			continue
+		}
+
+		// ---- 风险词（severity=3）：这里才真正调 AI ----
+		//
+		// 为什么在这一层调而不是在 preflight 里：preflight 是纯函数语义，
+		// 会被反复求值（探一遍 + 推一遍），在那里发起网络请求等于对同一条
+		// 内容送审两次 —— 多花钱，还会在审计表里留下成对的重复记录。
+		// 这里已经是"决定这条 op 走不走"的唯一位置，一次一条，干净。
+		//
+		// ⚠️ 与 REST 路径（moderation.go 的 gateByAI）语义必须一致：
+		// AI 判违规 → 拦这一条 op；AI 不可用/超时 → fail-open 放行。
+		if pre.aiRisk {
+			if reason, blocked := s.gateAIRisk(uid, op, pre); blocked {
+				errs = append(errs, op.Entity+" "+op.ID+": banned_word:"+reason)
+				continue
+			}
+		}
 
 		tx, err := s.db.sql.Begin()
 		if err != nil {
@@ -566,6 +922,13 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 			err = s.pushSnooze(tx, uid, op, dev)
 			if err == nil {
 				applied = append(applied, map[string]any{"entity": "snooze", "id": op.ID})
+			}
+		case "inbox":
+			// 收件箱不做字段级合并（per-user 私有行，没有并发改同一条的场景），
+			// 但**必须占 sync_log 的 seq**，否则别的设备永远拉不到它。
+			err = s.pushInboxItem(tx, uid, op, pre)
+			if err == nil {
+				applied = append(applied, map[string]any{"entity": "inbox", "id": op.ID})
 			}
 		default:
 			err = errForbidden

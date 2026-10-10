@@ -15,11 +15,7 @@ import (
 	"time"
 )
 
-// Weather for one fixed place.
-//
-// ⚠️ 这里的默认值只是**占位**，部署时请用 `-place` / `-lat` / `-lon` 换成你自己的位置。
-// 天气是按坐标查的，写死一个地点对别人没有意义；留一个中性的默认值，
-// 至少让第一次启动能跑起来、并且在界面上看得见"这是没配过的默认值"。
+// Weather for one fixed place: 北京市.
 //
 // met.no (the Norwegian Meteorological Institute) is the primary source. Their
 // terms require a User-Agent that actually identifies the caller and that you
@@ -31,7 +27,6 @@ import (
 // (marked stale) and Open-Meteo is tried as a second opinion.
 
 const (
-	// 中性占位（北京）。**不是**任何人的实际位置，请用 flag 覆盖。
 	defaultWeatherPlace = "北京市"
 	defaultWeatherLat   = 39.9042
 	defaultWeatherLon   = 116.4074
@@ -385,6 +380,43 @@ func wmoLabel(code int) string {
 // clockLocation is the timezone the forecast is grouped by. Zhanjiang has no
 // daylight saving, but grouping by the server's local zone would be wrong on a
 // server running in UTC.
+// weatherCoordinates 返回当前该用哪个坐标取天气。
+//
+// ## 优先级：应用内配置 > 启动参数
+//
+// 坐标原来**只能**通过启动参数（`-lat` / `-lon`）指定，改一次要重启服务端。
+// 现在允许用户在 App 里直接改城市，所以顺序是：
+//
+//  1. `app_settings` 里的 `weather_lat` / `weather_lon`（用户在 App 里设的）；
+//  2. stored 值缺失或非法 → 回落启动参数（也就是老行为，部署脚本不受影响）。
+//
+// ⚠️ 为什么要连**范围校验**一起做：经纬度写错（比如把 116.4 填到纬度上）
+// 会让 met.no 返回完全不相干地区的天气，而界面上看不出任何异常 ——
+// 用户只会觉得"这天气怎么这么不准"。所以超出范围的值得当"没设"处理。
+func (s *Server) weatherCoordinates() (float64, float64) {
+	lat, lon := s.cfg.WeatherLat, s.cfg.WeatherLon
+
+	if v := strings.TrimSpace(s.setting("weather_lat", "")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= -90 && f <= 90 {
+			lat = f
+		}
+	}
+	if v := strings.TrimSpace(s.setting("weather_lon", "")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= -180 && f <= 180 {
+			lon = f
+		}
+	}
+	return lat, lon
+}
+
+// weatherPlaceName 返回用户给这个坐标起的名字（显示用，可以空）。
+func (s *Server) weatherPlaceName() string {
+	if v := strings.TrimSpace(s.setting("weather_place", "")); v != "" {
+		return v
+	}
+	return s.cfg.WeatherPlace
+}
+
 func weatherZone() *time.Location {
 	loc, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
@@ -468,7 +500,8 @@ func (s *Server) Weather(hours int, days int) *weatherDoc {
 	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
-	doc, ttl, err := fetchMetNo(s.cfg.WeatherLat, s.cfg.WeatherLon, s.cfg.WeatherUA, client)
+	lat, lon := s.weatherCoordinates()
+	doc, ttl, err := fetchMetNo(lat, lon, s.cfg.WeatherUA, client)
 	if err != nil {
 		log.Printf("weather: met.no failed: %v", err)
 		if om, omErr := fetchOpenMeteo(s.cfg.WeatherLat, s.cfg.WeatherLon, s.cfg.WeatherUA, client); omErr == nil {
@@ -548,7 +581,8 @@ func (s *Server) handleWeather(w http.ResponseWriter, r *http.Request) {
 // works without waiting for the cache to expire.
 func (s *Server) weatherProbe() map[string]any {
 	client := &http.Client{Timeout: 15 * time.Second}
-	doc, _, err := fetchMetNo(s.cfg.WeatherLat, s.cfg.WeatherLon, s.cfg.WeatherUA, client)
+	lat, lon := s.weatherCoordinates()
+	doc, _, err := fetchMetNo(lat, lon, s.cfg.WeatherUA, client)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
@@ -564,7 +598,8 @@ func (s *Server) weatherProbe() map[string]any {
 // visible immediately instead of after the TTL expires.
 func (s *Server) handleWeatherDiag(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	met, _, metErr := fetchMetNo(s.cfg.WeatherLat, s.cfg.WeatherLon, s.cfg.WeatherUA, client)
+	lat, lon := s.weatherCoordinates()
+	met, _, metErr := fetchMetNo(lat, lon, s.cfg.WeatherUA, client)
 	om, omErr := fetchOpenMeteo(s.cfg.WeatherLat, s.cfg.WeatherLon, s.cfg.WeatherUA, client)
 	out := map[string]any{
 		"place": s.cfg.WeatherPlace, "lat": s.cfg.WeatherLat, "lon": s.cfg.WeatherLon,
@@ -602,3 +637,85 @@ func (s *Server) handleWeatherDiag(w http.ResponseWriter, r *http.Request) {
 }
 
 var _ = url.Values{}
+
+// ---------------------------------------------------------------------------
+// 天气城市设置
+// ---------------------------------------------------------------------------
+//
+// 坐标原来只能靠启动参数（`-lat` / `-lon`）改，也就是说**每换一个城市都要
+// 重启服务端、还要去改部署脚本**。对"给家里老人看本地天气"这种用途来说太重了。
+//
+// 所以开一个应用内可配的入口：写进 `app_settings`，取天气时优先用它
+// （见 weatherCoordinates）。启动参数退化成"没设过时的默认值"。
+//
+// 只让**管理员**改：天气是全家人共用的一个值，谁都能改会变成互相打架。
+
+type weatherLocationReq struct {
+	Lat   *float64 `json:"lat"`
+	Lon   *float64 `json:"lon"`
+	Place *string  `json:"place"`
+}
+
+// handleGetWeatherLocation 返回当前生效的坐标，以及它是从哪来的。
+func (s *Server) handleGetWeatherLocation(w http.ResponseWriter, r *http.Request) {
+	lat, lon := s.weatherCoordinates()
+	stored := s.setting("weather_lat", "") != "" && s.setting("weather_lon", "") != ""
+	source := "启动参数"
+	if stored {
+		source = "应用内设置"
+	}
+	writeJSON(w, 200, map[string]any{
+		"lat": lat, "lon": lon,
+		"place":  s.weatherPlaceName(),
+		"source": source,
+	})
+}
+
+// handleSetWeatherLocation 改坐标。
+//
+// 用 `*float64` 接：只改名字（不动坐标）是合理需求，指针能区分"没传"和"传了 0"
+// —— 经度 0 和纬度 0 都是合法值（格林尼治、赤道），不能拿 0 当"没传"。
+func (s *Server) handleSetWeatherLocation(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdmin(userIDOf(r)) {
+		apiErr(w, 403, "只有管理员能改天气城市")
+		return
+	}
+
+	var req weatherLocationReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apiErr(w, 400, "请求格式不对")
+		return
+	}
+
+	if req.Lat != nil {
+		if *req.Lat < -90 || *req.Lat > 90 {
+			apiErr(w, 400, "纬度要在 -90 ~ 90 之间")
+			return
+		}
+		if err := s.setSetting("weather_lat", strconv.FormatFloat(*req.Lat, 'f', 4, 64)); err != nil {
+			apiErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.Lon != nil {
+		if *req.Lon < -180 || *req.Lon > 180 {
+			apiErr(w, 400, "经度要在 -180 ~ 180 之间")
+			return
+		}
+		if err := s.setSetting("weather_lon", strconv.FormatFloat(*req.Lon, 'f', 4, 64)); err != nil {
+			apiErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.Place != nil {
+		if err := s.setSetting("weather_place", strings.TrimSpace(*req.Place)); err != nil {
+			apiErr(w, 500, err.Error())
+			return
+		}
+	}
+
+	lat, lon := s.weatherCoordinates()
+	writeJSON(w, 200, map[string]any{
+		"lat": lat, "lon": lon, "place": s.weatherPlaceName(), "source": "应用内设置",
+	})
+}

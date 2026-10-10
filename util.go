@@ -109,6 +109,49 @@ func apiErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
 }
 
+// apiErrDetail 在错误里带上机器可读的 code 与附加字段。
+//
+// 为什么需要它：前端对错误要做**不同处理** —— "含违禁词"要在对应输入框旁
+// 高亮并指出是哪个词，而"参数不合法"只要弹一句 toast。只给一句人话错误，
+// 前端就只能靠字符串匹配去猜，那是最脆的一类判断。
+//
+// code 是稳定的机器标识（如 banned_word），msg 是给人看的中文，extra 是
+// 结构化补充（字段名、命中的词、分类…）。**不破坏原有 {"error": msg} 的形状**，
+// 旧客户端读 error 字段照常工作。
+func apiErrDetail(w http.ResponseWriter, code int, errCode, msg string, extra map[string]any) {
+	out := map[string]any{"error": msg, "code": errCode}
+	for k, v := range extra {
+		out[k] = v
+	}
+	writeJSON(w, code, out)
+}
+
+// firstNonEmpty 返回第一个非空(去空白后)的字符串。全都为空返回空串。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// strOrEmpty 解引用可空字符串指针；nil 返回空串。
+//
+// ⚠️ **不要用 sync.go 里的 derefStr**：那个在 nil 时返回字面量 "null"
+// （它是给 SQL 写 null 用的），拿来做内容检查会导致"没填备注"被判成
+// 内容里有 "null" 这四个字母。
+//
+// 为什么需要这个版本：eventReq 之类请求体里的字段是 *string（为了区分
+// "没传"和"传了空串"），而做内容检查只关心"有没有内容"。
+// 直接 *req.Title 在 nil 时会 panic —— 那是从"用户没填备注"到"服务端崩"的直通车。
+func strOrEmpty(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
 // ---------- misc ----------
 
 func atoi64(s string) (int64, bool) {

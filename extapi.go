@@ -82,12 +82,20 @@ func (s *Server) authOrKey(next http.HandlerFunc) http.HandlerFunc {
 				apiErr(w, http.StatusUnauthorized, "API Key 无效或已被撤销")
 				return
 			}
+			// ⚠️ 外置接口这条路也要判封禁：否则一个被封的账号只要握着 API Key，
+			//    照样能读写日历 —— 而这条路的用户（第三方 AI）恰恰最不容易被发现。
+			if s.banGuard(w, uid) {
+				return
+			}
 			next(w, r.WithContext(context.WithValue(r.Context(), ctxUserID, uid)))
 			return
 		}
 		var uid string
 		if err := s.db.sql.QueryRow(`SELECT user_id FROM tokens WHERE token=?`, tok).Scan(&uid); err != nil {
 			apiErr(w, http.StatusUnauthorized, "凭证无效")
+			return
+		}
+		if s.banGuard(w, uid) {
 			return
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), ctxUserID, uid)))
@@ -337,6 +345,160 @@ func (s *Server) normalizeExtBody(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// normalizeExtCalendarBody 把外置 API 里的"人话"日历入参翻成服务端字段。
+//
+// 为什么需要（2026-09-25）：外置 API 在这之前**只能读日历**，日程却能增删改 ——
+// 第三方 AI 想"把课程表改名"或者"新建一个课程表日历"就完全做不到。
+// 补上写操作之后，顺带把入参也做成**和自带智能体同一套说法**：
+//
+//	course: true            → kind: "course"（当课程表用）
+//	shared: true            → kind: "shared"
+//	members: ["小明","小红"]  → member_ids（按名字查 id）
+//	member_ids: ["u_xx"]    → 原样透传
+//	name / color            → 原样透传
+//
+// ⚠️ **不猜**：名字查不到、或者重名，都**明确报错**并把现有的人列出来 ——
+// 静默忽略一个名字比报错危险得多（用户以为共享了，其实没有）。
+// ⚠️ 特意**不套** normalizeExtBody：那个会给 body 塞一个 `e_` 前缀的 id，
+// 对日历是脏数据（日历 id 由服务端 `newID("c_")` 生成）。
+func (s *Server) normalizeExtCalendarBody(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			next(w, r)
+			return
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			apiErr(w, 400, "读取请求体失败")
+			return
+		}
+		var m map[string]any
+		if json.Unmarshal(raw, &m) != nil {
+			// 不是对象就让 handler 自己去报错（保持和 normalizeExtBody 一致的行为）
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			next(w, r)
+			return
+		}
+
+		// name / color 必须是字符串；给别的类型直接拒绝，别让 json 解出个数字当名字
+		for _, k := range []string{"name", "color", "kind"} {
+			if v, ok := m[k]; ok && v != nil {
+				if _, isStr := v.(string); !isStr {
+					apiErr(w, 400, k+" 必须是字符串")
+					return
+				}
+			}
+		}
+
+		// course / shared 两个布尔开关 → kind（kind 是一个字段、三个取值互斥）
+		if b, ok := m["course"].(bool); ok {
+			delete(m, "course")
+			if b {
+				m["kind"] = "course"
+			} else if _, has := m["kind"]; !has {
+				// 取消勾选：kind 只能退回 private（没有"只去掉 course 那一位"的操作）
+				m["kind"] = "private"
+			}
+		} else if _, has := m["course"]; has {
+			apiErr(w, 400, "course 必须是 true / false")
+			return
+		}
+		if b, ok := m["shared"].(bool); ok {
+			delete(m, "shared")
+			if b {
+				m["kind"] = "shared"
+			}
+		} else if _, has := m["shared"]; has {
+			apiErr(w, 400, "shared 必须是 true / false")
+			return
+		}
+
+		// ⚠️ 先把**客户端给的** member_ids 校验掉，再做 members → member_ids 的转换。
+		//    反过来的话会把自己刚生成的值再校验一遍 ——
+		//    `members` 转出来的是 Go 的 `[]string`，而 JSON 解出来的数组是 `[]any`，
+		//    于是 `v.([]any)` 判定失败，自己把自己 400 掉（第一版就是这么错的）。
+		if v, ok := m["member_ids"]; ok && v != nil {
+			if _, isArr := v.([]any); !isArr {
+				apiErr(w, 400, "member_ids 必须是数组")
+				return
+			}
+		}
+
+		// members（名字数组）→ member_ids
+		if v, ok := m["members"]; ok && v != nil {
+			arr, isArr := v.([]any)
+			if !isArr {
+				apiErr(w, 400, "members 必须是数组（账号名字）")
+				return
+			}
+			lookup, err := s.usersByNames(arr)
+			if err != nil {
+				apiErr(w, 400, err.Error())
+				return
+			}
+			m["member_ids"] = lookup
+			delete(m, "members")
+		}
+
+		out, err := json.Marshal(m)
+		if err != nil {
+			apiErr(w, 500, err.Error())
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(out))
+		r.ContentLength = int64(len(out))
+		next(w, r)
+	}
+}
+
+// usersByNames 把账号名字数组翻成 id 数组。
+//
+// 查不到或重名都**直接报错**并把现有的账号列出来 —— 让模型/脚本能自己纠正，
+// 而不是把一条查不到的名字悄悄丢掉（那会变成"用户以为共享了，其实没有"）。
+func (s *Server) usersByNames(names []any) ([]string, error) {
+	rows, err := s.db.sql.Query(`SELECT id, name FROM users`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	byName := map[string][]string{}
+	all := []string{}
+	for rows.Next() {
+		var id, name string
+		if rows.Scan(&id, &name) != nil {
+			continue
+		}
+		byName[name] = append(byName[name], id)
+		all = append(all, name)
+	}
+	out := []string{}
+	seen := map[string]bool{}
+	for _, raw := range names {
+		// 只认字符串。给数字/对象就当空名字跳过（不猜它想指谁）——
+		// 真要传 id 请用 member_ids。
+		q, isStr := raw.(string)
+		if !isStr {
+			continue
+		}
+		q = trimSpace(q)
+		if q == "" {
+			continue
+		}
+		hits := byName[q]
+		if len(hits) == 0 {
+			return nil, fmt.Errorf("找不到账号「%s」。现在有：%s", q, strings.Join(all, "、"))
+		}
+		if len(hits) > 1 {
+			return nil, fmt.Errorf("有 %d 个账号都叫「%s」，没法确定是哪个 —— 请改用 member_ids", len(hits), q)
+		}
+		if !seen[hits[0]] {
+			seen[hits[0]] = true
+			out = append(out, hits[0])
+		}
+	}
+	return out, nil
+}
+
 // normalizeExtQuery turns `date=` / `days=` into the from/to the instances
 // handler wants, so callers never have to compute epoch seconds.
 func normalizeExtQuery(next http.HandlerFunc) http.HandlerFunc {
@@ -565,6 +727,18 @@ func openAPISpec() map[string]any {
 					"reminders":             map[string]any{"type": "array", "items": obj(map[string]any{"minutes_before": num("提前多少分钟")})},
 					"remind_minutes_before": map[string]any{"description": "reminders 的简写，可以是数字或数字数组"},
 				}, "calendar_id"),
+				// ★ 2026-09-25 加：日历本身也能写（以前只有读）。
+				//   `course` / `shared` 是两个**布尔简写**，服务端会翻成 `kind` ——
+				//   和自带智能体用同一套说法（`kind` 一个字段三取值互斥，很容易写错）。
+				"Calendar": obj(map[string]any{
+					"name":       str("日历名称"),
+					"color":      str("颜色 #RRGGBB"),
+					"kind":       str("private（只有自己可见）/ shared（共享）/ course（当课程表用，会出现在「课表」页）"),
+					"course":     map[string]any{"type": "boolean", "description": "kind=course 的简写"},
+					"shared":     map[string]any{"type": "boolean", "description": "kind=shared 的简写"},
+					"members":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "要一起共享的账号名字（查不到或重名会**明确报错**，不静默忽略）"},
+					"member_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "直接给账号 id（从 /users 拿）"},
+				}, "name"),
 			},
 		},
 		"security": []map[string]any{{"bearerAuth": []string{}}},
@@ -572,8 +746,28 @@ func openAPISpec() map[string]any {
 			"/whoami": map[string]any{"get": map[string]any{
 				"summary": "确认身份与可写日历", "operationId": "whoami",
 				"responses": map[string]any{"200": map[string]any{"description": "OK"}}}},
-			"/calendars": map[string]any{"get": map[string]any{
-				"summary": "列出所有日历", "operationId": "listCalendars",
+			"/calendars": map[string]any{
+				"get": map[string]any{
+					"summary": "列出所有日历（看 can_write 判断哪些能改）", "operationId": "listCalendars",
+					"responses": map[string]any{"200": map[string]any{"description": "OK"}}},
+				"post": map[string]any{
+					"summary": "新建日历", "operationId": "createCalendar",
+					"requestBody": map[string]any{"required": true, "content": map[string]any{
+						"application/json": map[string]any{"schema": map[string]any{"$ref": "#/components/schemas/Calendar"}}}},
+					"responses": map[string]any{"200": map[string]any{"description": "OK"}}}},
+			"/calendars/{id}": map[string]any{
+				"put": map[string]any{
+					"summary": "改日历（改名 / 改色 / 当课程表用；只传要改的字段）", "operationId": "updateCalendar",
+					"parameters": []map[string]any{map[string]any{"name": "id", "in": "path", "required": true, "schema": map[string]any{"type": "string"}}},
+					"requestBody": map[string]any{"required": true, "content": map[string]any{
+						"application/json": map[string]any{"schema": map[string]any{"$ref": "#/components/schemas/Calendar"}}}},
+					"responses": map[string]any{"200": map[string]any{"description": "OK"}}},
+				"delete": map[string]any{
+					"summary": "删除日历（只有创建者能删）", "operationId": "deleteCalendar",
+					"parameters": []map[string]any{map[string]any{"name": "id", "in": "path", "required": true, "schema": map[string]any{"type": "string"}}},
+					"responses":  map[string]any{"200": map[string]any{"description": "OK"}}}},
+			"/users": map[string]any{"get": map[string]any{
+				"summary": "列出账号（建/分享日历时用来拿 member_ids）", "operationId": "listUsers",
 				"responses": map[string]any{"200": map[string]any{"description": "OK"}}}},
 			"/agenda": map[string]any{"get": map[string]any{
 				"summary": "某天的日程 + 天气（推荐先调这个）", "operationId": "agenda",
@@ -619,7 +813,7 @@ func openAPISpec() map[string]any {
 					},
 					"responses": map[string]any{"200": map[string]any{"description": "OK"}}}},
 			"/weather": map[string]any{"get": map[string]any{
-				"summary": "逐小时天气预报（地点由服务端 -place/-lat/-lon 配置）", "operationId": "weather",
+				"summary": "逐小时天气预报（地点由 -place / -lat / -lon 配置）", "operationId": "weather",
 				"parameters": []map[string]any{
 					map[string]any{"name": "hours", "in": "query", "schema": map[string]any{"type": "integer"}},
 					map[string]any{"name": "days", "in": "query", "schema": map[string]any{"type": "integer"}},
@@ -629,7 +823,7 @@ func openAPISpec() map[string]any {
 	}
 }
 
-var guideMarkdown = `# 3e 日程服务 · 机器接口
+var guideMarkdown = `# 家庭日程 · 机器接口
 
 给 AI 或脚本用的日程读写接口。人用的界面是另外两套客户端，这里是纯净的 HTTP。
 
@@ -638,7 +832,7 @@ var guideMarkdown = `# 3e 日程服务 · 机器接口
 在客户端「设置 → 机器接口」里生成一个 API Key（形如 ` + "`fsk_...`" + `），然后：
 
 ` + "```" + `bash
-curl -H "Authorization: Bearer fsk_xxxxxxxx" https://YOUR-HOST:8443/api/ext/whoami
+curl -H "Authorization: Bearer fsk_xxxxxxxx" https://203.0.113.10:8443/api/ext/whoami
 ` + "```" + `
 
 自签证书场景记得带上 CA：` + "`curl --cacert ca.crt ...`" + `（Windows 自带 curl 是 Schannel 版，
@@ -670,7 +864,7 @@ curl -H "Authorization: Bearer $KEY" \
 
 ` + "```" + `
 2026-09-13 星期日，共 3 项
-09-13 09:00-10:00 牙医  [个人]  @市口腔医院
+09-13 09:00-10:00 牙医  [个人]  @医院
 09-13 14:30-15:30 周会  [工作]
 09-13 全天 交水电费  [个人]  (已完成)
 
@@ -725,10 +919,40 @@ curl -X PUT -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" 
   https://HOST:8443/api/ext/events/e_xxxx/occurrence
 ` + "```" + `
 
+## 日历本身也能改
+
+日程能增删改，日历也一样（` + "`GET /api/ext/calendars`" + ` 里 ` + "`can_write=true`" + ` 的才能改）：
+
+` + "```" + `bash
+# 新建一个"当课程表用"的日历
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"name": "大二上课程表", "color": "#378ADD", "course": true}' \
+  https://HOST:8443/api/ext/calendars
+
+# 改名字 / 换个颜色（只传要改的字段，没传的不会动）
+curl -X PUT -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"name": "大二下课程表", "color": "#E8833A"}' \
+  https://HOST:8443/api/ext/calendars/c_xxxx
+
+# 取消"当课程表用"（注意：kind 是一个字段、三个取值互斥，
+# 取消会退回 private，不会保留原来的共享状态）
+curl -X PUT -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"course": false}' https://HOST:8443/api/ext/calendars/c_xxxx
+
+# 删掉（只有创建者能删；里面的日程会一起删）
+curl -X DELETE -H "Authorization: Bearer $KEY" https://HOST:8443/api/ext/calendars/c_xxxx
+` + "```" + `
+
+- ` + "`course` / `shared`" + ` 是两个**布尔简写**，服务端会翻成 ` + "`kind`" + ` ——
+  比直接写 ` + "`kind`" + ` 不容易错（` + "`kind`" + ` 一个字段三个取值互斥）。
+- 要一起共享就给 ` + "`members: [\"小明\"]`" + `（账号名字）或 ` + "`member_ids`" + `（从 ` + "`GET /api/ext/users`" + ` 拿）。
+  **名字查不到或重名会明确报错**，不会静默丢掉一个名字 —— 免得你以为共享了其实没有。
+
 ## 其它
 
 - ` + "`GET /api/ext/calendars`" + ` 列出日历（` + "`can_write=true`" + ` 的才能写）
-- ` + "`GET /api/ext/weather`" + ` 逐小时预报（` + "`?hours=48&days=7`" + `）
+- ` + "`GET /api/ext/users`" + ` 列出账号（建 / 分享日历时拿 ` + "`member_ids`" + `）
+- ` + "`GET /api/ext/weather`" + ` 逐小时天气预报（` + "`?hours=48&days=7`" + `）
 - ` + "`GET /api/ext/openapi.json`" + ` 机器可读的接口描述，喂给模型最省事
 
 ## 冲突

@@ -266,7 +266,20 @@ func recomputeInstances(tx *sql.Tx, eventID string, now time.Time) error {
 	}
 
 	// --- current rows ---------------------------------------------------
+	//
+	// ★ 2026-09-28：这里必须把 calendar_id 一起读出来、一起比、一起写。
+	//
+	// 换日历只改 events 一行，instances 是**派生**的 —— 但"派生"不等于
+	// "会自动跟着变"：实例的重算靠下面那个 `same` 判定短路，而它原本只比
+	// 时间/标题/地点。于是"只换了日历、别的都没动"恰好落进 same==true
+	// 那一支 → 直接 continue → 实例永远留在**旧日历**上。
+	//
+	// 症状很隐蔽：日程行挪过去了，日程的实例没挪 —— 客户端按日历过滤实例，
+	// 结果就是"换完之后在哪儿都看着别扭"（旧日历里冒出来、新日历里没有）。
+	// 就算侥幸走了 upsert 分支，原来的 ON CONFLICT 也没更新 calendar_id，
+	// 一样是旧值。
 	type curRow struct {
+		calID                  string
 		start, end             int64
 		allDay, isTask, isOvr  int64
 		title, notes, location string
@@ -274,7 +287,7 @@ func recomputeInstances(tx *sql.Tx, eventID string, now time.Time) error {
 		deleted                sql.NullInt64
 	}
 	cur := map[int64]curRow{}
-	rows, err := tx.Query(`SELECT occurrence_key, start_utc, end_utc, all_day, title, notes,
+	rows, err := tx.Query(`SELECT occurrence_key, calendar_id, start_utc, end_utc, all_day, title, notes,
 		location, is_task, done_at, is_override, deleted_at FROM instances WHERE event_id=?`, eventID)
 	if err != nil {
 		return err
@@ -282,7 +295,7 @@ func recomputeInstances(tx *sql.Tx, eventID string, now time.Time) error {
 	for rows.Next() {
 		var k int64
 		var r curRow
-		if err := rows.Scan(&k, &r.start, &r.end, &r.allDay, &r.title, &r.notes,
+		if err := rows.Scan(&k, &r.calID, &r.start, &r.end, &r.allDay, &r.title, &r.notes,
 			&r.location, &r.isTask, &r.doneAt, &r.isOvr, &r.deleted); err == nil {
 			cur[k] = r
 		}
@@ -294,7 +307,8 @@ func recomputeInstances(tx *sql.Tx, eventID string, now time.Time) error {
 	// --- upsert changed / new -------------------------------------------
 	for k, want := range desired {
 		if r, ok := cur[k]; ok && !r.deleted.Valid {
-			same := r.start == want.StartUTC && r.end == want.EndUTC &&
+			same := r.calID == want.CalendarID &&
+				r.start == want.StartUTC && r.end == want.EndUTC &&
 				r.allDay == boolToInt(want.AllDay) && r.title == want.Title &&
 				r.notes == want.Notes && r.location == want.Location &&
 				r.isTask == boolToInt(want.IsTask) && r.isOvr == boolToInt(want.IsOverride) &&
@@ -313,6 +327,7 @@ func recomputeInstances(tx *sql.Tx, eventID string, now time.Time) error {
 				title,notes,location,is_task,done_at,is_override,seq,deleted_at)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
 			ON CONFLICT(id) DO UPDATE SET
+				calendar_id=excluded.calendar_id,
 				start_utc=excluded.start_utc, end_utc=excluded.end_utc, all_day=excluded.all_day,
 				title=excluded.title, notes=excluded.notes, location=excluded.location,
 				is_task=excluded.is_task, done_at=excluded.done_at,

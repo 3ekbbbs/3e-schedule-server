@@ -81,6 +81,71 @@ func atLeast(role, want string) bool {
 // The owner is derived from owner_id rather than from calendar_members so a
 // missing/half-written member row can never lock an owner out of their own
 // calendar.
+// teamRoleCeiling 团队共享能给一张日历带来的**最高**角色。
+//
+// ⚠️⚠️ **这个上限是团队功能的安全底线，不许放开。**
+//
+// 团队共享给的是"**内容可见性**"（能看到、能改日程），
+// **不是**"能管人"。如果团队能给到 admin，那么任何一个团队管理员
+// 只要建个团队、把别人的日历收进来，就能拿到那张日历的成员管理权 ——
+// 等于绕过了日历自己的成员名单，也绕过了"加成员必须 canManage"这条。
+//
+// 而且团队是可自建的（任何人能建团队），所以团队侧的角色**必须**比日历侧更严。
+const teamRoleCeiling = RoleEditor
+
+// teamRoleForCalendar 算出"我因为团队身份，对这张日历能拿到什么角色"。
+//
+// 一张日历可能共享给了多个团队，我可能在其中几个里 → 取最高的那个，
+// 再压到 teamRoleCeiling。
+//
+// 归属维度是 `team_members.user_id`（我在不在这几个团队里），
+// 不是日历权限 —— 这两个是**正交**的，别混。
+func (s *Server) teamRoleForCalendar(calendarID, uid string) (string, bool) {
+	if calendarID == "" || uid == "" {
+		return "", false
+	}
+	rows, err := s.db.sql.Query(
+		`SELECT ct.role FROM calendar_teams ct
+		 JOIN team_members tm ON tm.team_id = ct.team_id
+		 WHERE ct.calendar_id=? AND tm.user_id=?`, calendarID, uid)
+	if err != nil {
+		return "", false
+	}
+	defer rows.Close()
+	best := ""
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			continue
+		}
+		if r == "" {
+			// 空角色一律按最低处理 —— 宁可少给权限（和下面直接成员那条同一个原则）
+			r = RoleViewer
+		}
+		// 先压上限再比大小：如果行里存了个越界的 admin（手工改库/老数据），
+		// **不能**让它参与比较，否则一次比较就把上限绕过去了。
+		if !atLeast(teamRoleCeiling, r) {
+			r = teamRoleCeiling
+		}
+		if best == "" || atLeast(r, best) {
+			best = r
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return best, true
+}
+
+// calendarRole 返回某人对某张日历的**有效角色**。
+//
+// 这是**整个权限体系的唯一收口点** —— canRead / canWrite / canManageMembers
+// 全都走它，所以团队支持只要改这一个函数，所有调用点自动继承。
+//
+// 有效角色 = max(直接成员角色, 团队派生角色)
+//
+// ⚠️ 团队派生角色已经压过上限（≤ editor），所以这里不可能通过团队拿到
+// owner/admin。**owner 仍然只认 `calendars.owner_id`。**
 func (s *Server) calendarRole(calendarID, uid string) (string, bool) {
 	if calendarID == "" || uid == "" {
 		return "", false
@@ -93,22 +158,41 @@ func (s *Server) calendarRole(calendarID, uid string) (string, bool) {
 	if owner == uid {
 		return RoleOwner, true
 	}
+
+	// ① 直接成员
+	direct := ""
 	var role string
 	var deleted sql.NullInt64
 	err = s.db.sql.QueryRow(
 		`SELECT cm.role, c.deleted_at FROM calendar_members cm
 		 JOIN calendars c ON c.id = cm.calendar_id
 		 WHERE cm.calendar_id=? AND cm.user_id=?`, calendarID, uid).Scan(&role, &deleted)
-	if err != nil {
+	if err == nil {
+		direct = role
+		if direct == "" {
+			// 老库里 role 列可能为空（schema 默认写的是 'editor'，但历史行未必）。
+			// 空角色一律降为 viewer —— 宁可少给权限，不要因为一个空字符串把
+			// 只读成员变成可写成员。
+			direct = RoleViewer
+		}
+	}
+
+	// ② 团队派生
+	team, hasTeam := s.teamRoleForCalendar(calendarID, uid)
+
+	switch {
+	case direct == "" && !hasTeam:
 		return "", false
+	case direct == "":
+		return team, true
+	case !hasTeam:
+		return direct, true
 	}
-	if role == "" {
-		// 老库里 role 列可能为空（schema 默认写的是 'editor'，但历史行未必）。
-		// 空角色一律降为 viewer —— 宁可少给权限，不要因为一个空字符串把
-		// 只读成员变成可写成员。
-		role = RoleViewer
+	// 两边都有 → 取高的那个
+	if atLeast(team, direct) {
+		return team, true
 	}
-	return role, true
+	return direct, true
 }
 
 func (s *Server) canRead(calendarID, uid string) bool {
@@ -784,3 +868,38 @@ func (s *Server) handleLeaveCalendar(w http.ResponseWriter, r *http.Request) {
 
 // 它与成员名单**互不干涉**：关掉共享只是让"以后再加人"需要重新打开，
 // 已经分享出去的同学会继续看到这张日历（要收回请单独移除）。
+
+// calendarExists 判断日历行是否**还存在**（不区分是否已软删）。
+//
+// ★ 2026-09-28 补。用途只有一个：给"日程挂在一张已经没有任何日历行的日历上"
+// 这种孤儿数据开一条退路 —— 此时任何基于 calendarRole 的权限判定必然失败
+// （它 `SELECT owner_id FROM calendars WHERE id=?` 直接 ErrNoRows），
+// 于是那条日程在客户端**看得见、删不掉**（用户报的就是这个）。
+//
+// ⚠️ 不要拿它当权限判据：它回答的是"这张日历的行还在不在"，
+// 不是"我能不能动它"。权限一律走 calendarRole / canWrite。
+func (s *Server) calendarExists(id string) bool {
+	if id == "" {
+		return false
+	}
+	var one int
+	err := s.db.sql.QueryRow(`SELECT 1 FROM calendars WHERE id=?`, id).Scan(&one)
+	return err == nil
+}
+
+// isAdminUser 是 requireAdmin 的"只要答案不要响应"版本。
+//
+// requireAdmin 会直接往 w 里写 401/403 并返回 true，用在"路由入口"上；
+// 这里给它一个纯查询版本，好在别的判定里当**一个条件**用
+// （例如"这条孤儿日程是不是该放行给管理员删"）。
+// 查不到账号一律 false —— 默认值只能往收紧的方向偏。
+func (s *Server) isAdminUser(uid string) bool {
+	if uid == "" {
+		return false
+	}
+	var isAdmin int
+	if err := s.db.sql.QueryRow(`SELECT is_admin FROM users WHERE id=?`, uid).Scan(&isAdmin); err != nil {
+		return false
+	}
+	return isAdmin != 0
+}

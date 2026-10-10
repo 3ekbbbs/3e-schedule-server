@@ -105,6 +105,45 @@ func compareVersions(a, b string) int {
 	return 0
 }
 
+// handleUpdatesPublic 是给官网用的**公开**产物列表（2026-09-30）。
+//
+// 官网的下载按钮要指向"最新包"，而它原本是去扫自己那台机器上的 downloads 目录 ——
+// 那个目录是**手动放的**，于是长期停在旧版本（0.6.4 / 0.12.0），
+// 配上 COS 之后更糟：拼出来的地址指向**对象存储里不存在的对象**，点了直接 404。
+//
+// 现在改成问这里。**只有一个数据源**（发布时写进 manifest 的那份），
+// 官网再也不会和客户端看到不同的版本。
+//
+// ⚠️ 匿名可读，所以返回字段要**克制**：只给下载必需的（版本/文件名/大小/哈希/地址），
+//
+//	不要把 notes（发布备注）之类的内部信息顺手带出去。
+func (s *Server) handleUpdatesPublic(w http.ResponseWriter, r *http.Request) {
+	m := s.loadManifest()
+	out := map[string]any{}
+	for _, p := range []string{"android", "windows"} {
+		var art *updateArtifact
+		switch p {
+		case "android":
+			art = m.Android
+		case "windows":
+			art = m.Windows
+		}
+		if art == nil {
+			out[p] = nil
+			continue
+		}
+		out[p] = map[string]any{
+			"version":      art.Version,
+			"file":         filepath.Base(art.File),
+			"size":         art.Size,
+			"sha256":       art.SHA256,
+			"published_at": art.PublishedAt,
+			"download_url": s.downloadURLFor(p, art),
+		}
+	}
+	writeJSON(w, 200, out)
+}
+
 // handleUpdateCheck answers "should this client upgrade?".
 func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -151,10 +190,31 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		"size":         art.Size,
 		"sha256":       art.SHA256,
 		"published_at": art.PublishedAt,
-		"download_url": "/api/updates/download/" + platform,
+		"download_url": s.downloadURLFor(platform, art),
 	}
 	out["need_update"] = newer
 	writeJSON(w, 200, out)
+}
+
+// downloadURLFor 决定客户端从哪儿下这个包。
+//
+// 配了 `-cos-base` 就走对象存储（+CDN），否则回落到本机的下载接口。
+// 客户端**不需要改**：它对"不是自家路径"的地址是原样使用的
+// （见 `ApiClient.downloadUpdate` 里的 `ownDownloadPath` 判断）。
+//
+// ⚠️ 键的拼法 `<prefix>/<platform>/<文件名>` 必须和发布脚本
+// `scripts/lib/cos.mjs` 的 `cosKeyFor()` 严格一致 —— 两边错一个字符就是 404，
+// 而客户端只会报一句笼统的"下载失败"，很难查。
+func (s *Server) downloadURLFor(platform string, art *updateArtifact) string {
+	local := "/api/updates/download/" + platform
+	if art == nil || art.File == "" {
+		return local
+	}
+	base := strings.TrimRight(strings.TrimSpace(s.cfg.COSBase), "/")
+	if base == "" {
+		return local
+	}
+	return base + "/" + platform + "/" + filepath.Base(art.File)
 }
 
 // handleUpdateDownload streams the current artifact for a platform.

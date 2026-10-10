@@ -51,12 +51,60 @@
 - 客户端按 id upsert，重发天然幂等
 - 支持离线队列（`POST /api/sync/push`）：断网时的改动攒着，恢复后带幂等键补交
 
+**收件箱**
+
+- `inbox.go`：跨日历的通知汇总。日程的变更、邀请、冲突都往这里投一条，
+  客户端按未读数做角标
+
+**实时笔记协作（独立进程）**
+
+- `cmd/live/`：**单独一个可执行文件、单独一个端口**（默认 `:8445`）。
+  它和主服务端**同机部署但不是同一个程序** —— 主服务端管"是什么"，
+  它只负责把编辑动作即时转给别人（WebSocket）
+- 客户端先向主服务端换一张**自包含票据**（`live_ticket.go`，`lt_<payload>.<HMAC>`，
+  默认 5 分钟有效），再拿票据连协作进程 —— 于是**两边不需要共享会话表**
+- 进程间共享密钥（`-secret`），票据的 HMAC 由它签
+
+**账号与管理**
+
+- `account.go`：一键清空账户数据（日程 / 笔记 / 上传物），**不删账号本身**
+- `admin.go`：成员封禁 / 解封。**封禁刻意只在一个中间件里执行** ——
+  散在多处时"某些接口还能用"是必然的
+- `admin_ai.go`：AI 服务的配置（`base_url` / `model` / `api_key`）。
+  ⚠️ `api_key` 的"空串 / `null` / 有值"三种语义**必须分清** ——
+  空串是"清空"，`null` 是"不动"，因为设置页的密钥框是掩码回填，
+  把掩码原样提交回来会把真密钥覆盖掉
+- `audit.go`：管理动作的审计记录
+
+**内容审核与举报**
+
+- `reports.go`：用户举报（超时未读 / 未报 / 已报三态分明 ——
+  「读不出来」**不能**显示成「没有举报」，那会让举报的人以为自己白报了）
+- `moderation.go` / `moderation_ai.go` / `moderation_seed.go`：审核判定，
+  可选接入模型辅助；`moderation_seed.go` 是初始词表
+
+**邀请**
+
+- `invite.go`：邀请码的签发与使用（首个账号免邀请码，自动成为 admin）
+
+**数据维护**
+
+- `dedupe.go`：重复日程清理（同一账号里"同名同时刻"的历史脏数据）
+- `repair.go`：启动时的数据自检与修复（如孤儿字段、缺列）
+- `plugins.go`：插件市场的服务端侧 —— 读插件包里的
+  `assets/threees-plugin.json` 得到 id / 版本 / 能力清单，
+  **发布接口不接受调用方自己传这些**（否则可以伪造成任意插件）
+- `home_styles.go`：主页 HTML 卡片的**样式清单**（可选的取值集合）
+
 **其他**
 
-- 天气（met.no 为主，Open-Meteo 兜底；遵守 `Expires` 头 + 两级缓存，不轮询）
+- 天气（met.no 为主，Open-Meteo 兜底；遵守 `Expires` 头 + 两级缓存，不轮询）。
+  ⚠️ 地点和经纬度由命令行参数给（`-place` / `-lat` / `-lon`），
+  源码里的默认值只是一个**占位**，请改成你自己的
 - 课程表节次配置（`course.go`）
 - 机器接口（`/api/ext/*`）：给 AI / 脚本用的精简 API，配 OpenAPI 文档，用 `fsk_` 前缀的 API Key 鉴权
 - 应用内更新分发通道（`/api/updates`：按平台发布 / 比对版本 / 下载，带 sha256）
+- `deploy.go`：网页端的部署通道（把静态文件推上去）
 - 单文件 SQLite 存储，启动时自动迁移（`CREATE TABLE IF NOT EXISTS` + `ensureColumn` 做加法式演进）
 
 ---
@@ -185,22 +233,41 @@ curl -H "Authorization: Bearer fsk_xxxxxxxx" https://YOUR-HOST:8443/api/ext/agen
 ## 目录结构
 
 ```
-main.go        启动、路由表、配置
-db.go          SQLite 打开与迁移（schema 常量 + ensureColumn）
-models.go      对外的数据结构（JSON tag 是客户端契约 —— 改之前先想清楚）
-acl.go         角色模型、日历成员、按人提醒 / 强提醒
-auth.go        注册、登录、改密码、邀请码
-cal.go         日历 CRUD
-event.go       日程 CRUD、override、稍后提醒
-recur.go       RRULE 展开、实例计算
-sync.go        增量同步、字段级合并、冲突
-updates.go     应用内更新分发通道
-extapi.go      机器接口（/api/ext/*）+ OpenAPI + 使用指南
-weather.go     天气抓取与缓存
-course.go      课程表节次
-util.go        ID/令牌生成、密码哈希、各种编解码
-cmd/mkcert    自签证书工具
-cmd/rrulecheck 重复规则自检工具
+main.go         启动、路由表、配置
+db.go           SQLite 打开与迁移（schema 常量 + ensureColumn）
+models.go       对外的数据结构（JSON tag 是客户端契约 —— 改之前先想清楚）
+acl.go          角色模型、日历成员、按人提醒 / 强提醒
+auth.go         注册、登录、改密码
+account.go      一键清空账户数据
+admin.go        成员封禁 / 解封
+admin_ai.go     AI 服务配置（base_url / model / api_key）
+audit.go        管理动作的审计记录
+cal.go          日历 CRUD
+event.go        日程 CRUD、override、稍后提醒
+recur.go        RRULE 展开、实例计算
+sync.go         增量同步、字段级合并、冲突
+dedupe.go       重复日程清理
+repair.go       启动时的数据自检与修复
+inbox.go        收件箱（跨日历的通知汇总）
+invite.go       邀请码的签发与使用
+live_ticket.go  实时协作的 HMAC 自包含票据
+moderation.go   内容审核判定
+moderation_ai.go  审核的模型辅助（可选）
+moderation_seed.go 审核初始词表
+reports.go      用户举报
+plugins.go      插件市场（服务端侧）
+home_styles.go  主页卡片的样式清单
+deploy.go       网页端部署通道
+updates.go      应用内更新分发通道
+extapi.go       机器接口（/api/ext/*）+ OpenAPI + 使用指南
+weather.go      天气抓取与缓存
+course.go       课程表节次
+util.go         ID/令牌生成、密码哈希、各种编解码
+
+cmd/live/       实时笔记协作服务（**独立进程**，默认 :8445）
+cmd/mkcert/     自签证书工具
+cmd/mkcert-live/ 协作服务的证书工具
+cmd/rrulecheck/ 重复规则自检工具
 ```
 
 ---

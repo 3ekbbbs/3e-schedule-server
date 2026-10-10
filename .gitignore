@@ -33,3 +33,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 2026-10-10 补：本地协作服务的运行期文件
+live.log
+/dist/
+*.sha256

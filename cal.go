@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -60,12 +61,54 @@ func (s *Server) calendarByID(id, uid string) (*Calendar, bool) {
 // handleListCalendars returns every calendar the caller can see.
 // calendarsFor returns every calendar the user can see: the ones they own plus
 // the ones they are a member of.
+// calendarsFor 列出某个人能看到的**所有**日历。
+//
+// ⚠️⚠️ **这个查询是可见性的第二个收口点，不是"按 id 查一下"那么简单。**
+//
+// 原来这里只判 owner + calendar_members。2026-09-21 加团队时，
+// 我以为 `calendarRole` 是唯一收口点（canRead/canWrite 都走它）——
+// **这个假设在"列表"这类接口上不成立**：列表是"先查 id 再逐个取"，
+// 它自己就写了一遍可见性条件。
+//
+// 结果：团队共享出去的日历，成员在 `GET /api/calendars` 里**完全看不到**
+// （列表空），但按 id 访问却是通的 —— 表现是"团队里的人说没收到那张日历"。
+// `scripts/team-check.mjs` 的"通过团队看到那张日历"一条直接抓到了它。
+//
+// 所以以后**任何**按人筛日历的地方，都要同时考虑这三条路径：
+//
+//	① 我是 owner
+//	② 我在 calendar_members 里
+//	③ 我在 calendar_teams 关联的某个团队里（团队共享）
+//
+// 少一条就会出现"能访问但列表里没有"这种半通状态。
+// ★★ 2026-09-25 补了一个漏了两年的过滤条件：`c.deleted_at IS NULL`。
+//
+// 删日历走的是**软删**（`handleDeleteCalendar` 只 `UPDATE calendars SET deleted_at=...`
+// 并抬 seq，好让 tombstone 能同步给各端）。但**这里没有把软删的排除掉** ——
+// 于是 `GET /api/calendars`（和 `GET /api/ext/calendars`）**照样把删掉的日历列出来**。
+//
+// 用户的原话正是这个：「有些日历明明删掉了，但它还在列表里面，再点击删除提示不存在」 ——
+// 列表里有它（所以能点删除），真去删又 404（因为 `calendarRole` 那边看不到软删的），
+// 于是就卡成"删不掉、也消不掉"。
+//
+// ⚠️ 各端**本地镜像**那层也有 `!c.deleted_at` 过滤（电脑端 `store.calendars()`），
+//
+//	所以以前只是"某些路径看不到" —— 但**服务端自己不筛就是错的**：
+//	外置 API 直接读它，第三方 AI 会看到一堆幽灵日历。
+//
+// ⚠️ 加条件时括号不能少：`A IS NULL AND (B OR C OR D)`，
+//
+//	写成 `A IS NULL AND B OR C OR D` 的话后两个 OR 会绕过整个条件。
 func (s *Server) calendarsFor(uid string) ([]Calendar, error) {
 	rows, err := s.db.sql.Query(`
 		SELECT c.id FROM calendars c
-		WHERE c.owner_id = ?
-		   OR EXISTS(SELECT 1 FROM calendar_members m WHERE m.calendar_id=c.id AND m.user_id=?)
-		ORDER BY c.created_at`, uid, uid)
+		WHERE c.deleted_at IS NULL
+		  AND (c.owner_id = ?
+		       OR EXISTS(SELECT 1 FROM calendar_members m WHERE m.calendar_id=c.id AND m.user_id=?)
+		       OR EXISTS(SELECT 1 FROM calendar_teams ct
+		                  JOIN team_members tm ON tm.team_id = ct.team_id
+		                  WHERE ct.calendar_id=c.id AND tm.user_id=?))
+		ORDER BY c.created_at`, uid, uid, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +160,10 @@ func (s *Server) handleCreateCalendar(w http.ResponseWriter, r *http.Request) {
 	req.Name = trimSpace(req.Name)
 	if req.Name == "" {
 		apiErr(w, 400, "日历名称不能为空")
+		return
+	}
+	// 违禁词闸门：日历名是会出现在别人共享列表里的，必须过一遍
+	if s.blockedByWords(w, r, map[string]string{"日历名称": req.Name}) {
 		return
 	}
 	if req.Color == "" {
@@ -196,6 +243,16 @@ func (s *Server) handleUpdateCalendar(w http.ResponseWriter, r *http.Request) {
 	if err := readJSON(r, &req); err != nil {
 		apiErr(w, 400, "bad json")
 		return
+	}
+	// 违禁词闸门：只在**本次真的改了名字**时检查。
+	//
+	// 不传 name 表示"不改名"，此时若拿旧名字去查会**误伤** —— 旧名可能是
+	// 词库建立之前就存在的历史数据，用户这次只想改个颜色，却被拦下来说
+	// "名字违规"。所以判据必须是"这次要写入什么"，不是"这条数据长什么样"。
+	if strings.TrimSpace(req.Name) != "" {
+		if s.blockedByWords(w, r, map[string]string{"日历名称": req.Name}) {
+			return
+		}
 	}
 
 	tx, err := s.db.sql.Begin()

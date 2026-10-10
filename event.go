@@ -3,7 +3,9 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -37,8 +39,52 @@ type eventReq struct {
 	DeviceID string  `json:"device_id"`
 }
 
+// pendingEventFields 算出"这次 PUT 之后，这条日程的这几个字段会是什么"。
+//
+// 做法：以库里现有的值为底，用本次请求里**非 nil** 的字段覆盖。
+// 只有参与了才会被检查 —— 没传的字段保持原值，如果原值合规就永远不会被拦，
+// 这正是我们想要的（改时间不该因为旧标题而被拦）。
+//
+// ⚠️ 字段清单与 applyFieldMerge 的合并范围必须一致。这里直接复用
+// req.incomingMap() 的键，而不是另抄一份 —— 抄一份的下场是"以后新增了可改
+// 字段，拦截范围没跟着扩"，那是一个静默的绕过口子。
+func (s *Server) pendingEventFields(ev *Event, req *eventReq) map[string]string {
+	// 先把库里的值铺上，再用请求覆盖
+	cur := map[string]string{
+		"title":    ev.Title,
+		"notes":    ev.Notes,
+		"location": ev.Location,
+	}
+	in := req.incomingMap()
+	out := map[string]string{}
+	for field, label := range map[string]string{
+		"title": "标题", "notes": "备注", "location": "地点",
+	} {
+		if _, touched := in[field]; !touched {
+			continue // 本次没改这一栏 → 不检查（避免拿旧内容误拦）
+		}
+		// 改了这一栏：取本次要给的值；给的是空串就是"要清空"，清空当然合规
+		v := cur[field]
+		if sv, ok := in[field].(string); ok {
+			v = sv
+		}
+		if strings.TrimSpace(v) != "" {
+			out[label] = v
+		}
+	}
+	return out
+}
+
 func (req *eventReq) incomingMap() jsonMap {
 	m := jsonMap{}
+	// ★ 换日历。空串是"没传"，不是"挪到不存在的日历" —— 一条日程**必须**
+	// 属于某张日历（calendar_id 在外键意义上是必填的），所以只接受非空值。
+	//
+	// 这里同时也让 POST /api/events 的 field_seqs 带上 calendar_id：
+	// 新建时它就是权威基线，后续第一次移动才不会莫名其妙报冲突。
+	if req.CalendarID != "" {
+		m["calendar_id"] = req.CalendarID
+	}
 	if req.Title != nil {
 		m["title"] = *req.Title
 	}
@@ -85,6 +131,56 @@ func (req *eventReq) incomingMap() jsonMap {
 	return m
 }
 
+// ---------------------------------------------------------------------------
+// 时间合理性闸门（2026-10-08）
+// ---------------------------------------------------------------------------
+//
+// 用户报的原话：「AI 写的那个日期有问题……好像写到了 1970 年。我要你不仅提升
+// AI 的能力，并且要做一下我们代码的健壮性，就是**通过程序兜底**来避免这种事」。
+//
+// 根因在客户端（把 epoch **秒**又除了 1000），那边已经修了。但服务端作为
+// **最后一道**必须自己也能拦住 —— 五端都在往这里写，任何一端的单位算错，
+// 落下来就是一条谁也看不见的脏数据：
+//
+//	dtstart 落在实例时间窗口（今天-7 天 ~ 今天+90 天）之外
+//	  → 日程列表里**看不见**（界面读的是 instances）
+//	  → 但查重读的是 events **全表** → "已经有一条同名日程了"
+//	  → 又因为查/删都按时间窗口找 → 拿不到它的 id，**删不掉**
+//
+// 所以这里**只做物理上不可能的判断**（区间外的年份、end 早于 start、
+// 时长超过 366 天），不掺任何产品规则 —— 补录去年的课、记一个生日
+// 都是用户的正当意愿，那些归客户端界面管。
+//
+// ⚠️ 数值必须和安卓端 `data/EventTime.kt` 里的常量**保持一致**，改一起改
+//
+//	（那边有同样一段说明，两边互相指着）。
+const (
+	// 2000-01-01 00:00:00 UTC
+	eventMinStartUTC = 946684800
+	// 2100-01-01 00:00:00 UTC
+	eventMaxStartUTC = 4102444800
+	// 单条日程最长 366 天。它不是产品限制，而是**单位错的照妖镜**：
+	// dtstart 是毫秒而 duration 是秒（或反过来）时，算出来的时长会离谱地大。
+	eventMaxDurationSec = 366 * 86400
+)
+
+// saneStartUTC 判断一对「开始时间 + 时长」是否合理到可以落库。
+// 返回空串 = 通过，否则是给客户端看的原因。
+func saneStartUTC(startUTC int64, durationSec int64) string {
+	if startUTC < eventMinStartUTC || startUTC >= eventMaxStartUTC {
+		return fmt.Sprintf(
+			"开始时间不在合理范围（2000~2100 年），收到的是 %d —— 多半是把时间戳当成了日期",
+			startUTC)
+	}
+	if durationSec < 0 {
+		return "日程时长不能是负数"
+	}
+	if durationSec > eventMaxDurationSec {
+		return fmt.Sprintf("单条日程的时长超过了 366 天（%d 天）", durationSec/86400)
+	}
+	return ""
+}
+
 func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	uid := userIDOf(r)
 	var req eventReq
@@ -102,6 +198,25 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.DTStartUTC == nil || *req.DTStartUTC == 0 {
 		apiErr(w, 400, "缺少开始时间")
+		return
+	}
+	// ★ 时间闸门：和「缺少开始时间」同属**参数校验**，所以放在违禁词闸门之前
+	//   （违禁词那一步要读内容，更"贵"，也没必要为一条坏时间跑一遍）。
+	durIn := int64(0)
+	if req.DurationSec != nil {
+		durIn = *req.DurationSec
+	}
+	if why := saneStartUTC(*req.DTStartUTC, durIn); why != "" {
+		apiErr(w, 400, why)
+		return
+	}
+	// 违禁词闸门：放在权限与参数校验**之后**、写库**之前**。
+	// 顺序有意为之 —— 没权限的人不该通过"报错文案"探到这部日历的内容规则。
+	if s.blockedByWords(w, r, map[string]string{
+		"标题": strOrEmpty(req.Title),
+		"备注": strOrEmpty(req.Notes),
+		"地点": strOrEmpty(req.Location),
+	}) {
 		return
 	}
 
@@ -126,10 +241,8 @@ func (s *Server) handleCreateEvent(w http.ResponseWriter, r *http.Request) {
 	if req.RRule != nil && *req.RRule != "" {
 		rr = sql.NullString{String: *req.RRule, Valid: true}
 	}
-	dur := int64(0)
-	if req.DurationSec != nil {
-		dur = *req.DurationSec
-	}
+	// 时长复用上面闸门里已经算好的那份，别算两遍（两处一旦写岔就是隐患）
+	dur := durIn
 	var doneAt any
 	if req.DoneAt != nil {
 		doneAt = *req.DoneAt
@@ -232,6 +345,56 @@ func (s *Server) handleUpdateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ---- 换日历：目标日历**也要**有写权限 ----
+	//
+	// 上面那句 `canWrite(ev.CalendarID)` 只回答"你能不能动这条日程"，
+	// 回答不了"你能不能往那张日历里塞东西"。少了这一句，就是把日程
+	// **塞进自己没有写权限的日历**（只读的共享日历、别人的私人日历）——
+	// 一旦落地，那条日程就变成"看得见、改不动、删不掉"，比移动失败更糟。
+	//
+	// 目标日历不存在时 canWrite 一律 false，所以不需要额外判存在性。
+	// 目标 = 原日历时不校验（那是"原地保存"，上面已经放行过）。
+	if req.CalendarID != "" && req.CalendarID != ev.CalendarID {
+		if !s.canWrite(req.CalendarID, uid) {
+			apiErr(w, 403, "目标日历你没有编辑权限")
+			return
+		}
+	}
+
+	// ★ 时间闸门（2026-10-08）。校验的是**合并之后**的最终值，不是只看本次传入 ——
+	//   PUT 是局部合并（只传 title 就只改 title），只看传入值会漏掉
+	//   "库里本来就是坏的，这次又被原样写回去"这种情况。
+	//
+	// ⚠️ 因此这条也意味着：**一条时间已经坏掉的日程不能再通过 PUT 改任何字段**
+	//    （改标题也会被拒）。这是**有意**的 —— 它的正确归宿是**删掉**，
+	//    客户端的「设置 → 数据维护 → 清理时间异常的日程」就是干这个的，
+	//    报错文案里也直接指了那条路，免得用户对着一条改不动的日程干瞪眼。
+	effStart := ev.DTStartUTC
+	if req.DTStartUTC != nil {
+		effStart = *req.DTStartUTC
+	}
+	effDur := ev.DurationSec
+	if req.DurationSec != nil {
+		effDur = *req.DurationSec
+	}
+	if why := saneStartUTC(effStart, effDur); why != "" {
+		apiErr(w, 400, why+"。如果这条日程的时间本来就是坏的，"+
+			"请在「设置 → 数据维护 → 清理时间异常的日程」里删掉它，不要再改它。")
+		return
+	}
+
+	// 违禁词闸门：检查**合并后的最终值**，而不是只看本次传入的字段。
+	//
+	// ⚠️ 这一步不能省。PUT 是局部合并（只传 title 就只改 title），如果只检查
+	// 传入的键，绕过路径是：先建一条标题干净的日程，再单独 PUT 改 title ——
+	// 一样落地。反过来只检查传入值还会**误伤**：用户只想改时间、没传 title，
+	// 若把库里已有的内容当"新写入"查，本来合规的老内容也会被拦。
+	//
+	// 所以：以库里现有值为底，叠加本次传入的非 nil 字段，检查这个结果集。
+	if s.blockedByWords(w, r, s.pendingEventFields(ev, &req)) {
+		return
+	}
+
 	tx, err := s.db.sql.Begin()
 	if err != nil {
 		apiErr(w, 500, err.Error())
@@ -284,30 +447,76 @@ func (s *Server) handleDeleteEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.canWrite(ev.CalendarID, uid) {
-		apiErr(w, 403, "这个日历你没有编辑权限")
-		return
+		// ★ 2026-09-28 放宽：「日程挂在**已经不存在的日历**上」要能删掉。
+		//
+		// 用户报的原话：「那个不存在日历的日程没有删干净……网页端和手机端
+		// 还是有残留，而且这两端好像没有对应的方法删除」—— 后半句就是这里。
+		//
+		// 根因：日程的 `calendar_id` 指向一张**连行都没有**的日历时，
+		// `canWrite` 内部的 `calendarRole` 直接 ErrNoRows → 恒 false
+		// → 这条日程在界面上**看得见、删不掉**，只能靠管理员接口清库。
+		//
+		// 例外**只给创建者本人**（`ev.UID`）和管理员：
+		//   · 不是自己建的日程，即使它的日历没了也不许动（否则等于开了
+		//     "猜一个 event_id 就能删别人日程"的口子）；
+		//   · 日历**行还在（哪怕已软删）**时不走这条路 —— 那种情况
+		//     `calendarRole` 查得到 owner，权限判定本来就是正常的。
+		orphanOwned := ev.UID != "" && ev.UID == uid && !s.calendarExists(ev.CalendarID)
+		if !orphanOwned && !s.isAdminUser(uid) {
+			apiErr(w, 403, "这个日历你没有编辑权限")
+			return
+		}
 	}
-	tx, err := s.db.sql.Begin()
-	if err != nil {
-		apiErr(w, 500, err.Error())
-		return
-	}
-	defer tx.Rollback()
-	now := time.Now().Unix()
-	seq, _ := nextSeq(tx, "event", id, "delete")
-	if _, err := tx.Exec(`UPDATE events SET deleted_at=?, seq=?, updated_at=? WHERE id=?`, now, seq, now, id); err != nil {
-		apiErr(w, 500, err.Error())
-		return
-	}
-	if err := recomputeInstances(tx, id, time.Now()); err != nil {
-		apiErr(w, 500, err.Error())
-		return
-	}
-	if err := tx.Commit(); err != nil {
+	// ⚠️ 上面这套放宽**只对"删"成立**。"改"（handleUpdateEvent）仍然要求
+	// `canWrite(ev.CalendarID)` —— 所以孤儿日程是「删得掉、但改不动」，
+	// 别在这里读成"改也放开了"。
+	//
+	// 为什么不顺手把"改"也放开：孤儿日程的正常归宿是 autoRepair 把它改挂到
+	// 创建者的私人日历（repair.go 第 ③ 段），那条路已经兜住了；再在 PUT 上
+	// 开一个"是创建者就放行"的口子，等于多一条越权面，收益却接近零。
+	if err := s.deleteEventCore(uid, id); err != nil {
 		apiErr(w, 500, err.Error())
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// deleteEventCore 是"删一条日程"的**唯一实现**，用户删除与管理员删除都走它。
+//
+// 为什么要抽出来（而不是让管理员那边自己写一段 SQL）：
+// 删除不只是"把 deleted_at 填上" —— 它还要 **抬 event 的 seq** 并
+// **重算 instances**，客户端才会同步掉这条（客户端靠 seq 变化发现删除）。
+// 管理员那边若图省事只 UPDATE deleted_at，结果是"管理员删了、服务端也没了，
+// 但所有客户端还显示着，而且再也不会同步掉" —— 这是本系统最难查的一类故障。
+// 让两条路径共用同一个函数，这个错误就不可能发生。
+//
+// 参数 uid 只用于记录是谁删的（审计），**不做权限判断** ——
+// 权限由各调用方自己把住（用户删除走 canWrite，管理员删除走 requireAdmin）。
+func (s *Server) deleteEventCore(uid, id string) error {
+	_ = uid
+	tx, err := s.db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	seq, err := nextSeq(tx, "event", id, "delete")
+	if err != nil {
+		return err
+	}
+	res, err := tx.Exec(`UPDATE events SET deleted_at=?, seq=?, updated_at=? WHERE id=? AND deleted_at IS NULL`,
+		now, seq, now, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// 已经被删过了。不是错误（幂等），但也不要继续往下走去重算实例。
+		return tx.Commit()
+	}
+	if err := recomputeInstances(tx, id, time.Now()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type occurrenceReq struct {
