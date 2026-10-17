@@ -1,0 +1,334 @@
+/* 自由画布（free-canvas）样式 —— 2026-10-15
+ *
+ * 三块东西，分得很开：
+ *  · `.fc-tools` / `.fc-stage` / `.fc-page`  画布本体（编辑态）
+ *  · `.fc-el` / `.fc-selbox` / `.fc-h*` / `.fc-guide`  元素与选择装饰
+ *  · `.fc-libgrid` / `.fc-row` / `.fc-sec` / `.fc-layer`  三个面板的控件
+ *
+ * ⚠️ 配色**全部走 skin-studio 的 `--ss-*` 变量**（设计台是深色工具风格，
+ *    和 App 外观无关）。独立打开这一页时在文件末尾给了兜底值。
+ *
+ * ⚠️ `.fc-page` 里的 `* { pointer-events: none }` 是**故意的**，别删：
+ *    元素内部（尤其「代码」块里用户写的 HTML）可能有自己的按钮/链接，
+ *    不挡掉的话点一下就跑动作，而用户在编辑态想做的是"选中这个元素"。
+ */
+
+/* ---------------- 画布骨架 ---------------- */
+.fc-host { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+
+.fc-tools {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 6px 8px; background: var(--ss-panel2, #1e222a);
+  border-bottom: 1px solid var(--ss-line, #2a2f38);
+}
+.fc-tb {
+  min-width: 30px; height: 28px; padding: 0 8px;
+  background: transparent; color: var(--ss-text, #e6e9ef);
+  border: 1px solid transparent; border-radius: 7px;
+  font: 13px/1 -apple-system, "Noto Sans SC", system-ui, sans-serif;
+  cursor: pointer;
+}
+.fc-tb:hover { background: rgba(255, 255, 255, .07); border-color: var(--ss-line, #2a2f38); }
+.fc-tb.on { background: var(--ss-accent, #5b9dff); color: #08121f; font-weight: 600; }
+.fc-tb.sm { min-width: 26px; padding: 0 6px; }
+.fc-tsep { width: 1px; height: 18px; background: var(--ss-line, #2a2f38); margin: 0 4px; }
+
+.fc-stage {
+  flex: 1; min-height: 0; overflow: auto;
+  display: flex; align-items: flex-start; justify-content: center;
+  /* ⚠️ 这里的 24 必须和 free-canvas.js 的 `fitScale()` 里那个 `pad`（48 = 24×2）
+     对上 —— 改一个忘另一个的话，自动缩放会算错，画布底部会被裁掉一小截。 */
+  padding: 24px; background:
+    linear-gradient(45deg, rgba(255, 255, 255, .022) 25%, transparent 25%) 0 0/22px 22px,
+    linear-gradient(-45deg, rgba(255, 255, 255, .022) 25%, transparent 25%) 0 0/22px 22px,
+    var(--ss-bg, #0f1115);
+}
+
+/* 缩放壳：尺寸 = 画布 × 缩放比（`.fc-page` 用 transform 缩放，不影响布局） */
+.fc-fit { flex: none; position: relative; }
+
+.fc-zoom {
+  font: 11px/1 ui-monospace, Menlo, Consolas, monospace;
+  color: var(--ss-muted, #9aa3b2); padding: 0 4px; user-select: none;
+}
+
+.fc-page {
+  position: relative; flex: none;
+  border-radius: 14px; overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .5), 0 0 0 1px rgba(255, 255, 255, .09);
+  background: #f7f8fa; color: #1b1b1f;
+  font-family: -apple-system, system-ui, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+.fc-page.brush { cursor: crosshair; }
+/* ⚠️ 见文件头：元素本身接事件，元素内部一律不接 */
+.fc-page .fc-el { pointer-events: auto; cursor: move; }
+.fc-page .fc-el * { pointer-events: none !important; }
+.fc-page .fc-el.lock { cursor: default; }
+.fc-page .fc-el.hide { opacity: .28; }
+.fc-page .fc-el.on { outline: 1.5px solid var(--ss-accent, #5b9dff); outline-offset: 0; }
+.fc-page .fc-el.editing { cursor: text; outline: 2px solid var(--ss-accent, #5b9dff); }
+.fc-page .fc-el.editing * { pointer-events: auto !important; }
+
+/* ---------------- 选择框 / 手柄 / 参考线 ---------------- */
+.fc-overlay, .fc-guides {
+  position: absolute; inset: 0; pointer-events: none; z-index: 10000;
+}
+.fc-guides { z-index: 10001; }
+.fc-selbox {
+  border: 1.5px dashed rgba(91, 157, 255, .95); pointer-events: none;
+}
+.fc-hbox { pointer-events: none; }
+.fc-h {
+  position: absolute; width: 11px; height: 11px; margin: -6px 0 0 -6px;
+  background: #fff; border: 1.5px solid var(--ss-accent, #5b9dff); border-radius: 3px;
+  pointer-events: auto; box-sizing: border-box;
+}
+.fc-h-nw { left: 0; top: 0; cursor: nwse-resize; }
+.fc-h-n  { left: 50%; top: 0; cursor: ns-resize; }
+.fc-h-ne { left: 100%; top: 0; cursor: nesw-resize; }
+.fc-h-e  { left: 100%; top: 50%; cursor: ew-resize; }
+.fc-h-se { left: 100%; top: 100%; cursor: nwse-resize; }
+.fc-h-s  { left: 50%; top: 100%; cursor: ns-resize; }
+.fc-h-sw { left: 0; top: 100%; cursor: nesw-resize; }
+.fc-h-w  { left: 0; top: 50%; cursor: ew-resize; }
+.fc-h-rot {
+  left: 50%; top: -26px; border-radius: 50%; background: var(--ss-accent, #5b9dff);
+  border-color: #fff; cursor: grab;
+}
+.fc-h-rot::after {
+  content: ''; position: absolute; left: 50%; top: 100%; width: 1.5px; height: 20px;
+  background: var(--ss-accent, #5b9dff); transform: translateX(-50%);
+}
+.fc-guide { background: #ff4d8d; box-shadow: 0 0 3px rgba(255, 77, 141, .8); }
+.fc-marquee {
+  border: 1px solid var(--ss-accent, #5b9dff);
+  background: rgba(91, 157, 255, .16);
+  pointer-events: none; z-index: 10002;
+}
+
+/* ---------------- 面板控件 ---------------- */
+.fc-libgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.fc-libitem {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 9px 4px; border-radius: 9px; cursor: grab;
+  background: var(--ss-panel2, #1e222a); color: var(--ss-text, #e6e9ef);
+  border: 1px solid var(--ss-line, #2a2f38);
+  font: 11px/1 -apple-system, "Noto Sans SC", system-ui, sans-serif;
+}
+.fc-libitem:hover { border-color: var(--ss-accent, #5b9dff); background: rgba(91, 157, 255, .12); }
+.fc-libicon { font-size: 16px; line-height: 1; }
+
+.fc-widebtn {
+  width: 100%; margin-top: 8px; padding: 8px; border-radius: 9px; cursor: pointer;
+  background: var(--ss-panel2, #1e222a); color: var(--ss-text, #e6e9ef);
+  border: 1px dashed var(--ss-line, #2a2f38); font-size: 12px;
+}
+.fc-widebtn:hover { border-color: var(--ss-accent, #5b9dff); }
+
+/* ---------------- 起手模板 ---------------- */
+.fc-tpls { margin-top: 14px; display: flex; flex-direction: column; gap: 5px; }
+.fc-tplhead { font-size: 11px; color: var(--ss-muted, #9aa3b2); margin-bottom: 2px; }
+.fc-tpl {
+  display: flex; align-items: center; gap: 9px; text-align: left;
+  padding: 8px 10px; border-radius: 9px; cursor: pointer;
+  background: var(--ss-panel2, #1e222a); color: var(--ss-text, #e6e9ef);
+  border: 1px solid var(--ss-line, #2a2f38);
+}
+.fc-tpl:hover { border-color: var(--ss-accent, #5b9dff); background: rgba(91, 157, 255, .1); }
+.fc-tplicon { flex: none; font-size: 15px; line-height: 1; width: 18px; text-align: center; }
+.fc-tpltext { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.fc-tpltext b { font-size: 12px; font-weight: 600; }
+.fc-tpltext i {
+  font-style: normal; font-size: 10.5px; color: var(--ss-muted, #9aa3b2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.fc-note {
+  margin: 8px 0 0; padding: 8px 10px; border-radius: 9px;
+  background: rgba(91, 157, 255, .08); border-left: 2px solid var(--ss-accent, #5b9dff);
+  color: var(--ss-muted, #9aa3b2); font-size: 11px; line-height: 1.65;
+}
+.fc-note code {
+  background: rgba(255, 255, 255, .09); padding: 1px 4px; border-radius: 4px;
+  font-size: 10.5px; color: var(--ss-text, #e6e9ef);
+}
+.fc-dim { color: var(--ss-muted, #9aa3b2); font-size: 12px; }
+
+.fc-sec {
+  border: 1px solid var(--ss-line, #2a2f38); border-radius: 10px;
+  margin-bottom: 8px; overflow: hidden; background: var(--ss-panel2, #1e222a);
+}
+.fc-sec > summary {
+  cursor: pointer; padding: 8px 10px; font-size: 12px; font-weight: 600;
+  color: var(--ss-text, #e6e9ef); list-style: none; user-select: none;
+}
+.fc-sec > summary::marker, .fc-sec > summary::-webkit-details-marker { display: none; }
+.fc-sec > summary::before { content: '▸ '; color: var(--ss-muted, #9aa3b2); }
+.fc-sec[open] > summary::before { content: '▾ '; }
+.fc-secbody { padding: 4px 10px 10px; }
+
+.fc-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.fc-lab { flex: none; width: 54px; font-size: 11px; color: var(--ss-muted, #9aa3b2); }
+.fc-ctl { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; }
+.fc-two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.fc-two .fc-row { margin: 0; }
+.fc-two .fc-lab { width: 22px; }
+
+.fc-inp {
+  width: 100%; min-width: 0; padding: 5px 8px; border-radius: 7px;
+  background: var(--ss-bg, #0f1115); color: var(--ss-text, #e6e9ef);
+  border: 1px solid var(--ss-line, #2a2f38);
+  font: 12px/1.4 -apple-system, "Noto Sans SC", system-ui, sans-serif;
+}
+.fc-inp:focus { outline: none; border-color: var(--ss-accent, #5b9dff); }
+textarea.fc-area { resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5; }
+.fc-numwrap { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; }
+.fc-numwrap .fc-inp { width: 100%; }
+.fc-suf { font-size: 10px; color: var(--ss-muted, #9aa3b2); flex: none; }
+
+.fc-colorwrap { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; flex-wrap: wrap; }
+.fc-color {
+  width: 34px; height: 26px; padding: 0; border: 1px solid var(--ss-line, #2a2f38);
+  border-radius: 7px; background: transparent; cursor: pointer;
+}
+.fc-swatches { display: flex; gap: 4px; flex-wrap: wrap; }
+.fc-sw {
+  width: 17px; height: 17px; border-radius: 5px; cursor: pointer; padding: 0;
+  border: 1px solid rgba(255, 255, 255, .22);
+}
+.fc-swnone { background: transparent; color: var(--ss-muted, #9aa3b2); font-size: 9px; line-height: 15px; }
+
+.fc-btns { display: flex; gap: 5px; flex-wrap: wrap; margin: 6px 0; }
+.fc-btn {
+  padding: 5px 9px; border-radius: 7px; cursor: pointer; font-size: 11px;
+  background: var(--ss-bg, #0f1115); color: var(--ss-text, #e6e9ef);
+  border: 1px solid var(--ss-line, #2a2f38);
+}
+.fc-btn:hover { border-color: var(--ss-accent, #5b9dff); }
+.fc-btn.danger:hover { border-color: #e5484d; color: #ff8a8f; }
+.fc-check { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+
+.fc-icons { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; }
+.fc-iconbtn {
+  display: flex; align-items: center; justify-content: center; padding: 5px 0;
+  border-radius: 7px; cursor: pointer; background: var(--ss-bg, #0f1115);
+  border: 1px solid var(--ss-line, #2a2f38); color: var(--ss-muted, #9aa3b2);
+}
+.fc-iconbtn:hover { color: var(--ss-text, #e6e9ef); border-color: var(--ss-accent, #5b9dff); }
+.fc-iconbtn.on { color: var(--ss-accent, #5b9dff); border-color: var(--ss-accent, #5b9dff); background: rgba(91, 157, 255, .14); }
+
+/* ---------------- 图层列表 ---------------- */
+.fc-layer {
+  display: flex; align-items: center; gap: 6px; padding: 5px 7px;
+  border-radius: 8px; cursor: pointer; font-size: 12px;
+  border: 1px solid transparent;
+}
+.fc-layer:hover { background: rgba(255, 255, 255, .05); }
+.fc-layer.on { background: rgba(91, 157, 255, .16); border-color: var(--ss-accent, #5b9dff); }
+.fc-licon { flex: none; width: 15px; text-align: center; font-size: 11px; color: var(--ss-muted, #9aa3b2); }
+.fc-lname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fc-lbtn {
+  flex: none; width: 19px; height: 19px; padding: 0; border: 0; border-radius: 5px;
+  background: transparent; color: var(--ss-muted, #9aa3b2); cursor: pointer; font-size: 10px; line-height: 1;
+}
+.fc-lbtn:hover { background: rgba(255, 255, 255, .1); color: var(--ss-text, #e6e9ef); }
+.fc-lbtn.danger:hover { background: rgba(229, 72, 77, .2); color: #ff8a8f; }
+
+/* ---------------- 预览 ---------------- */
+.fc-pvframe { display: block; margin: 0 auto; box-shadow: 0 10px 34px rgba(0, 0, 0, .5); }
+
+/* 独立打开（不挂 skin-studio）时的兜底配色 */
+.fc-host { --ss-bg: #0f1115; --ss-panel: #171a20; --ss-panel2: #1e222a; --ss-line: #2a2f38; --ss-text: #e6e9ef; --ss-muted: #9aa3b2; --ss-accent: #5b9dff; }
+
+/* ---------------- 空白画布的引导层（不是元素，不参与导出） ---------------- */
+.fc-blank {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(88%, 300px); padding: 18px 16px; border-radius: 16px; box-sizing: border-box;
+  background: rgba(255, 255, 255, .94); border: 1px dashed rgba(0, 0, 0, .18);
+  text-align: center; z-index: 5;
+}
+.fc-page.dark .fc-blank { background: rgba(30, 34, 42, .94); border-color: rgba(255, 255, 255, .22); }
+.fc-blank-t { font-size: 15px; font-weight: 600; color: #1b1b1f; margin-bottom: 6px; }
+.fc-page.dark .fc-blank-t { color: #e6e9ef; }
+.fc-blank-s { font-size: 12px; line-height: 1.75; color: #6E7681; margin-bottom: 12px; }
+.fc-page.dark .fc-blank-s { color: #9aa3b2; }
+.fc-blank-row { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+.fc-blank-btn {
+  padding: 6px 11px; border-radius: 9px; cursor: pointer; font-size: 12px;
+  background: #2F6FB5; color: #fff; border: 0; font-family: inherit;
+}
+.fc-blank-btn:hover { filter: brightness(1.12); }
+
+/* 设计台里点动作的提示（**不真的执行** —— 真执行了页面就跳走了） */
+.fc-mocktoast {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  background: rgba(20, 22, 28, .94); color: #fff; font: 12px/1.5 system-ui;
+  padding: 8px 14px; border-radius: 10px; z-index: 99999; pointer-events: none;
+}
+
+/* 从外观包导入（左栏最上面那个）—— 比普通按钮显眼一点，它是"接着上次改"的入口 */
+.fc-importbtn {
+  margin: 0 0 12px; border-style: solid; border-color: rgba(91, 157, 255, .5);
+  background: rgba(91, 157, 255, .12); color: var(--ss-text, #e6e9ef); font-weight: 600;
+}
+.fc-importbtn:hover { background: rgba(91, 157, 255, .22); border-color: var(--ss-accent, #5b9dff); }
+
+/* ---------------- 源码渲染背景层（手机端真实渲染，只读） ----------------
+ * 铺在画布底下：里面跑的是 android/shared-ui 编译出来的 WasmJS，
+ * 和真机是**同一份 Compose 源码** —— 所以"画布和手机不一样"在结构上不可能。
+ * ⚠️ pointer-events:none 是必须的：它是背景，不能吃掉画布上的鼠标事件。
+ */
+.fc-shellwrap {
+  position: absolute; left: 0; top: 0; right: 0; bottom: 0;
+  overflow: hidden; pointer-events: none; z-index: 0; background: #FAFAF8;
+}
+.fc-shellframe { display: block; width: 100%; height: 100%; border: 0; pointer-events: none; }
+.fc-page.dark .fc-shellwrap { background: #12151A; }
+
+/* 内容区参考线：元素放在顶栏/底栏上会被原生 UI 盖住，这条线把边界画出来 */
+.fc-shellmark {
+  position: absolute; left: 0; right: 0; pointer-events: none; z-index: 1;
+  border-top: 1px dashed rgba(91, 157, 255, .6);
+  border-bottom: 1px dashed rgba(91, 157, 255, .6);
+}
+
+/* ---------------- 源码渲染层的加载提示 ----------------
+ * 用户原话："它没有任何进度提示，让我以为它没加载" —— wasm 8MB，
+ * 加载期间画布是一片底色，和"设计台坏了"长得一模一样。
+ */
+.fc-shellload {
+  position: absolute; inset: 0; z-index: 3;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  background: rgba(250, 250, 248, .96); text-align: center; padding: 0 24px;
+  transition: opacity .35s ease;
+}
+.fc-page.dark .fc-shellload { background: rgba(18, 21, 26, .96); }
+.fc-shellload.done { opacity: 0; pointer-events: none; }
+.fc-spin {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 3px solid rgba(47, 111, 181, .25); border-top-color: #2F6FB5;
+  animation: fc-spin .8s linear infinite;
+}
+@keyframes fc-spin { to { transform: rotate(360deg); } }
+.fc-shellload-t { font-size: 13px; font-weight: 600; color: #1b1b1f; }
+.fc-page.dark .fc-shellload-t { color: #e6e9ef; }
+.fc-shellload-s { font-size: 11px; line-height: 1.6; color: #6E7681; }
+.fc-page.dark .fc-shellload-s { color: #9aa3b2; }
+
+/* ---------------- 块热区（手机端画的块 → 可点选的控件） ----------------
+ * 手机端画的是 canvas（像素图），点不了。所以 wasm 把每个块的 rect 报出来，
+ * 这里在同样位置铺一层透明热区 —— 点它就能选中那个块。
+ */
+.fc-hotlayer { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.fc-hot {
+  position: absolute; pointer-events: auto; cursor: pointer;
+  border: 1.5px dashed transparent; border-radius: 10px; box-sizing: border-box;
+  transition: border-color .12s ease, background .12s ease;
+}
+.fc-hot:hover { border-color: rgba(91, 157, 255, .7); background: rgba(91, 157, 255, .07); }
+.fc-hot.on {
+  border-color: #5b9dff; border-style: solid;
+  background: rgba(91, 157, 255, .13);
+  box-shadow: 0 0 0 1px rgba(91, 157, 255, .35);
+}

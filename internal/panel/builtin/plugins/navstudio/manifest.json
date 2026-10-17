@@ -1,0 +1,10 @@
+{
+  "id": "navstudio",
+  "name": "导航标注台",
+  "version": "1.0.0",
+  "description": "在腾讯地图上标注校内楼栋、入口与楼梯，发布成 navpack 数据包。手机端导航插件用它提供的数据。",
+  "icon": "🧭",
+  "entry": "index.html",
+  "publisher": "3e学习助手",
+  "api": true
+}

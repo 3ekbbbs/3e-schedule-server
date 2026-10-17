@@ -1,0 +1,10 @@
+{
+  "id": "skinstudio",
+  "name": "外观标注台",
+  "version": "1.0.0",
+  "description": "编辑并分发 skinpack 外观包（壁纸、图标、配色）。界面已经接进来了，功能按计划暂不迭代。",
+  "icon": "🎨",
+  "entry": "index.html",
+  "publisher": "3e学习助手",
+  "api": true
+}

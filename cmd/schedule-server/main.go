@@ -29,6 +29,7 @@ var (
 	showVersion = flag.Bool("version", false, "打印版本号后退出")
 	initOnly    = flag.Bool("init", false, "写入默认配置后退出")
 	noBrowser   = flag.Bool("no-browser", false, "启动面板时不自动打开浏览器")
+	importDB    = flag.String("import-db", "", "把指定的 .db 迁移成本机数据（会先备份当前库，然后退出）")
 )
 
 func main() {
@@ -67,6 +68,26 @@ func main() {
 	}
 
 	resolved := cfg.Resolve(baseDir)
+
+	// 从旧版本迁移数据。这是一次性命令：做完就退出，不启动面板也不启动服务。
+	// 走命令行而不是自动检测，是因为"换库"这种动作不该在用户没看见的时候发生。
+	if *importDB != "" {
+		// 先接上日志：发布版没有控制台，报告只能从 data/logs/migrate.log 里看。
+		setupLogging(resolved.DataDir, "migrate.log")
+		src := *importDB
+		if !filepath.IsAbs(src) {
+			src = filepath.Join(baseDir, src)
+		}
+		if err := panel.ImportDatabase(panel.Options{
+			Config:     cfg,
+			ConfigPath: cfgPath,
+			ExePath:    exePath,
+			BaseDir:    baseDir,
+		}, src); err != nil {
+			fatal("迁移失败", err)
+		}
+		return
+	}
 
 	if *runServer {
 		setupLogging(resolved.DataDir, "server.log")

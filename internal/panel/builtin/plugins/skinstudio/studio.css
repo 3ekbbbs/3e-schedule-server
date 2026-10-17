@@ -1,0 +1,688 @@
+/* 外观设计台（skin-studio）样式 —— 2026-10-14 v3：拖拽布局编辑器
+ *
+ * 两套东西分得很开：
+ *  · `.ss-*` = 设计台自己的界面（深色工具风格，跟 App 外观无关）
+ *  · `.ph-*` = **手机模拟器里的画面**（这一部分必须和手机端一致，颜色全部走 CSS 变量，
+ *              变量由 `skin-studio.js` 按皮肤算出来后写在 `.ph` 上）
+ *
+ * ⚠️ 改 `.ph-*` 之前想清楚：这里的每一个尺寸/圆角/间距都在"假装是手机"。
+ *    手机端那些数字来自 `UiSkin`（卡片圆角 16dp、底栏 56dp…），改这里等于让设计台
+ *    变成第三套口径。真要改，先改手机端，再回来同步。
+ *
+ * v3 新增的四组东西（找代码时按注释分节）：
+ *   · 三栏骨架（顶栏 + 大纲/画布/检查器）
+ *   · 块画布（.ss-blk 主页块 / .ss-pblk 页面块 / 拖放指示 .ss-drop-*）
+ *   · 画布点选（[data-sel] 悬停虚线 + .sel-on 选中描边 + ::after 对象名角标）
+ *   · 大纲树 / 检查器 / 发布模态 / 块类型菜单
+ */
+
+:root {
+  --ss-bg: #0f1115;
+  --ss-panel: #171a20;
+  --ss-panel2: #1e222a;
+  --ss-line: #2a2f38;
+  --ss-text: #e6e9ef;
+  --ss-muted: #9aa3b2;
+  --ss-accent: #5b9dff;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--ss-bg);
+  color: var(--ss-text);
+  font: 13px/1.5 -apple-system, "Noto Sans SC", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* ---------------- 骨架：顶栏 + 三栏 ---------------- */
+.ss-shell { display: flex; flex-direction: column; height: 100vh; }
+.ss-main { flex: 1; display: grid; grid-template-columns: 250px 1fr 348px; min-height: 0; }
+@media (max-width: 1180px) { .ss-main { grid-template-columns: 1fr 348px; } .ss-left { display: none; } }
+
+.ss-left, .ss-right {
+  background: var(--ss-panel);
+  overflow-y: auto;
+  padding: 10px;
+  min-height: 0;
+}
+.ss-left { border-right: 1px solid var(--ss-line); }
+.ss-right { border-left: 1px solid var(--ss-line); }
+.ss-mid { display: flex; flex-direction: column; overflow: hidden; }
+
+.ss-colhead {
+  font-size: 12px; font-weight: 600; margin: 2px 2px 10px;
+  display: flex; align-items: baseline; gap: 8px;
+}
+.ss-colhead-sub { font-size: 10px; font-weight: 400; color: var(--ss-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------------- 顶栏（设计台自己的） ---------------- */
+.ss-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-bottom: 1px solid var(--ss-line); background: var(--ss-panel);
+}
+.ss-bar .ss-brand { font-weight: 600; }
+.ss-selpath {
+  font-size: 11px; color: var(--ss-muted);
+  border-left: 1px solid var(--ss-line); padding-left: 10px;
+  max-width: 34%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ss-pubbtn {
+  background: var(--ss-accent); border: 1px solid var(--ss-accent); color: #06101f;
+  border-radius: 9px; padding: 6px 12px; font: inherit; font-weight: 600; cursor: pointer;
+}
+.ss-pubbtn:hover { filter: brightness(1.08); }
+.ss-icobtn {
+  width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center;
+  justify-content: center; font-size: 14px; padding: 0; background: var(--ss-panel2);
+  color: var(--ss-text); border: 1px solid var(--ss-line); cursor: pointer;
+}
+.ss-icobtn:disabled { opacity: .35; cursor: default; }
+/* 开着的开关型按钮（目前只有 ⌨ 源码渲染）：必须一眼看出"它现在是开着的" */
+.ss-icobtn.on {
+  background: var(--ss-accent, #4c8dff); border-color: var(--ss-accent, #4c8dff);
+  color: #fff;
+}
+.ss-dirty {
+  font-size: 11px; padding: 3px 9px; border-radius: 999px; white-space: nowrap;
+  background: rgba(255, 176, 61, .14); color: #ffc46b; border: 1px solid rgba(255, 176, 61, .3);
+}
+.ss-dirty.clean { background: rgba(126, 226, 168, .12); color: #7ee2a8; border-color: rgba(126, 226, 168, .28); }
+
+/* ---------------- 控件（检查器 / 模态里共用的表单件） ---------------- */
+.ss-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+.ss-row > label { flex: 0 0 96px; color: var(--ss-muted); font-size: 11px; }
+.ss-row > .ss-field { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; }
+
+input[type="text"], input[type="number"], select, textarea {
+  width: 100%; background: var(--ss-panel2); color: var(--ss-text);
+  border: 1px solid var(--ss-line); border-radius: 8px; padding: 5px 7px; font: inherit;
+}
+textarea { resize: vertical; min-height: 56px; font: 11px/1.5 ui-monospace, Menlo, monospace; }
+input[type="color"] {
+  width: 30px; height: 26px; padding: 0; border: 1px solid var(--ss-line);
+  border-radius: 6px; background: var(--ss-panel2); flex: 0 0 auto;
+}
+input[type="range"] { flex: 1; }
+.ss-val { flex: 0 0 42px; text-align: right; color: var(--ss-muted); font-size: 11px; }
+
+button {
+  background: var(--ss-panel2); color: var(--ss-text); border: 1px solid var(--ss-line);
+  border-radius: 8px; padding: 6px 10px; font: inherit; cursor: pointer;
+}
+button:hover { border-color: var(--ss-accent); }
+button.primary { background: var(--ss-accent); border-color: var(--ss-accent); color: #06101f; font-weight: 600; }
+button.danger { color: #ff8a8a; }
+button.tiny { padding: 3px 7px; font-size: 11px; }
+.ss-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+.ss-note { color: var(--ss-muted); font-size: 11px; margin: 6px 0; }
+.ss-note b { color: var(--ss-text); }
+.ss-ok { color: #7ee2a8; }
+.ss-bad { color: #ff9a9a; }
+
+.ss-sec { border-top: 1px solid var(--ss-line); padding-top: 10px; margin-top: 12px; }
+.ss-sec:first-child { border-top: none; padding-top: 0; margin-top: 0; }
+.ss-sec > h3 {
+  font-size: 12px; font-weight: 600; margin: 0 0 8px;
+  color: var(--ss-text); display: flex; align-items: center; gap: 6px;
+}
+.ss-sec > h3 .ss-tag {
+  font-size: 10px; font-weight: 400; color: var(--ss-muted);
+  border: 1px solid var(--ss-line); border-radius: 999px; padding: 1px 6px;
+}
+
+/* 折叠卡（decorate() 把 .ss-sec 升级成的形状） */
+.ss-card { border: 1px solid var(--ss-line); border-radius: 12px; background: var(--ss-panel2); margin-bottom: 10px; overflow: hidden; }
+.ss-card > .ss-card-h {
+  display: flex; align-items: center; gap: 8px; padding: 9px 11px; cursor: pointer; user-select: none;
+}
+.ss-card > .ss-card-h b { font-size: 12px; font-weight: 600; }
+.ss-card > .ss-card-h .ss-tag { font-size: 10px; font-weight: 400; color: var(--ss-muted); border: 1px solid var(--ss-line); border-radius: 999px; padding: 1px 6px; }
+.ss-card > .ss-card-h .ss-caret { color: var(--ss-muted); font-size: 11px; margin-left: auto; }
+.ss-card > .ss-card-b { padding: 2px 11px 11px; border-top: 1px solid var(--ss-line); }
+.ss-card.closed > .ss-card-b { display: none; }
+
+/* 色块（27 角色那一列） */
+.ss-swatch { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.ss-swatch .ss-chip { width: 26px; height: 26px; border-radius: 7px; border: 1px solid var(--ss-line); flex: 0 0 auto; }
+.ss-swatch .ss-name { flex: 1; font-size: 11px; color: var(--ss-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ss-search { position: relative; margin-bottom: 8px; }
+.ss-hidden { display: none !important; }
+
+/* 预设 */
+.ss-presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.ss-preset {
+  border: 1px solid var(--ss-line); border-radius: 10px; padding: 7px 8px; cursor: pointer;
+  background: var(--ss-panel2); display: flex; flex-direction: column; gap: 3px;
+}
+.ss-preset:hover { border-color: var(--ss-accent); }
+.ss-preset .ss-preset-t { font-size: 11px; font-weight: 600; }
+.ss-preset .ss-preset-d { font-size: 10px; color: var(--ss-muted); }
+.ss-preset .ss-dots { display: flex; gap: 3px; }
+.ss-preset .ss-dots i { width: 12px; height: 12px; border-radius: 4px; border: 1px solid rgba(255,255,255,.15); }
+
+/* ---------------- 大纲树（左栏） ---------------- */
+.ss-ol-group { font-size: 10px; color: var(--ss-muted); letter-spacing: .05em; margin: 12px 4px 5px; }
+.ss-ol-group:first-child { margin-top: 2px; }
+.ss-ol-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 7px; border-radius: 9px; text-align: left;
+  background: transparent; border: 1px solid transparent; cursor: pointer;
+  margin-bottom: 1px; font: inherit; color: inherit;
+}
+.ss-ol-item:hover { background: var(--ss-panel2); border-color: var(--ss-line); }
+.ss-ol-item.on { background: rgba(91,157,255,.14); border-color: var(--ss-accent); }
+.ss-ol-ico { flex: 0 0 auto; font-size: 14px; width: 18px; text-align: center; }
+.ss-ol-txt { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ss-ol-t { font-size: 12px; color: var(--ss-text); display: flex; align-items: center; gap: 5px; }
+.ss-ol-item.on .ss-ol-t { color: #cfe2ff; font-weight: 600; }
+.ss-ol-s { font-size: 10px; color: var(--ss-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ss-ol-badge {
+  flex: 0 0 auto; font-size: 10px; min-width: 17px; text-align: center;
+  padding: 1px 5px; border-radius: 999px;
+  background: rgba(91,157,255,.18); color: #9cc4ff; border: 1px solid rgba(91,157,255,.35);
+}
+.ss-ol-prev { font-style: normal; font-size: 9px; color: #7ee2a8; }
+/* 块子行（页面下面的块）—— 缩进一级 */
+.ss-ol-blk { padding-left: 24px; }
+.ss-ol-blk .ss-ol-t { font-size: 11px; }
+/* 跨页拖放目标高亮 */
+.ss-ol-item.dropok { background: rgba(91,157,255,.25) !important; border-color: var(--ss-accent) !important; }
+.ss-ol-item.dropok::after { content: '松手放到这页'; font-size: 9px; color: #9cc4ff; margin-left: auto; }
+
+/* ---------------- 手机模拟器（v3.1：以手机端 MainScreen/HomePage 真实结构为准） ----------------
+ *
+ * 手机端的结构（对照 MainScreen.kt 的 Scaffold / HomePage.kt）：
+ *   状态栏（edge-to-edge：底色与顶栏/页面连成一体，不是独立色带）
+ *   顶栏 Row：应用名「3e学习助手」+ 同步副标题 ｜ [同步] [⚙️]（沉浸页 mdnote/mdnotelive 无）
+ *   内容区：flex:1 吃满剩余（原来是写死 536px → 底下悬空 152px 的那个 bug）
+ *   底栏 NavigationBar：主页永远正中间，左右各 2 模块槽；settings 不进底栏（顶栏 ⚙️）
+ *   抽屉：**主页下拉露出的"桌子"**（不是侧边面板）—— 全部功能 + 快捷入口
+ *         横滚 chips + 模块 4 列格 + [设置][自定义主页]，高 344dp
+ */
+.ss-stage {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  gap: 26px; padding: 18px; overflow: auto;
+  background:
+    radial-gradient(1200px 600px at 50% 0%, #1a1f28 0%, #0f1115 60%);
+}
+.ss-device { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.ss-device .ss-device-label { color: var(--ss-muted); font-size: 11px; }
+
+/* 机身：393×852（手机端逻辑尺寸），四周留 10px 边框 */
+.ss-frame {
+  position: relative; padding: 10px; border-radius: 62px;
+  background: linear-gradient(180deg, #2a2f38, #14171c);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .55), inset 0 0 0 1px #3a4048;
+  transform-origin: center center;
+}
+.ss-frame::after { /* 灵动岛 */
+  content: ''; position: absolute; left: 50%; top: 20px; transform: translateX(-50%);
+  width: 96px; height: 26px; border-radius: 999px; background: #000; z-index: 10; pointer-events: none;
+}
+
+/* 屏幕：**所有皮肤变量都写在这一层**。整列 flex —— 底栏天然贴底。 */
+.ph {
+  position: relative; overflow: hidden;
+  display: flex; flex-direction: column;
+  width: 393px; height: 852px; border-radius: 52px;
+  background: var(--ph-bg);
+  color: var(--ph-on-bg);
+  font-family: var(--ph-ff);
+  font-weight: var(--ph-fw);
+  letter-spacing: var(--ph-ls);
+}
+.ph-decor { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+/* ---- 源码渲染层（⌨ 切换）：盖在 .ph 上的 iframe，里面是手机端编译的同一份 Compose ----
+ * z-index 6 而不是 10：机身那个"灵动岛"（.ss-frame::after, z-index 10）要留在最上层。
+ */
+.ss-srcwrap { position: absolute; inset: 0; z-index: 6; background: var(--ph-bg); }
+.ss-srcwrap[hidden] { display: none; }
+.ss-srcwrap iframe { display: block; width: 100%; height: 100%; border: 0; background: var(--ph-bg); }
+.ss-srcwrap .ss-srcbadge {
+  position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%);
+  max-width: calc(100% - 24px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  padding: 3px 10px; border-radius: 999px; font-size: 10px; line-height: 1.6;
+  background: rgba(0, 0, 0, .62); color: #fff; pointer-events: none;
+}
+
+/* 状态栏 44px —— edge-to-edge：底色跟随顶栏/页面（applyVars 算好 --ph-status-bg） */
+.ph-status {
+  position: relative; z-index: 1; height: 44px; flex: 0 0 44px;
+  display: flex; align-items: flex-end;
+  justify-content: space-between; padding: 0 26px 4px;
+  font-size: 12px; font-weight: 600; color: var(--ph-status-fg);
+  background: var(--ph-status-bg);
+}
+.ph-status .ph-right { display: flex; gap: 5px; align-items: center; font-size: 11px; }
+
+/* 顶栏 = Scaffold topBar 那条手画 Row（MainScreen.kt）：应用名 + 同步副标题 + [同步][⚙️]。
+ * 沉浸页（mdnote / mdnotelive）整条不渲染（renderTop 判 IMMERSIVE_PAGES）。 */
+.ph-top {
+  position: relative; z-index: 1; flex: 0 0 56px; height: 56px;
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 16px; background: var(--ph-top-bg);
+}
+.ph-top .ph-app-col { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+.ph-top .ph-app { font-size: 16px; font-weight: 600; }
+.ph-top .ph-sync { font-size: 10px; color: var(--ph-muted); }
+.ph-top .ph-tb-btn {
+  flex: 0 0 auto; font-size: 12px; padding: 4px 10px; border-radius: 999px;
+  color: var(--ph-primary); cursor: pointer;
+}
+
+/* 内容区：flex:1 —— 吃掉剩余全部高度（44+56+64 之外都是它的）。 */
+.ph-content {
+  position: relative; z-index: 1; flex: 1 1 auto; min-height: 0;
+  overflow-y: auto; padding: 10px 12px 14px;
+  background: var(--ph-page-bg);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.ph-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.ph-tab {
+  font-size: 11px; padding: 3px 9px; border-radius: 999px;
+  background: var(--ph-card2); color: var(--ph-muted);
+}
+.ph-tab.on { background: var(--ph-primary); color: var(--ph-on-primary); font-weight: 600; }
+
+/* ---- 主页两层结构（v3.3：虚拟化下拉抽屉，对照 HomePage.kt 的 Box{desk, sheet}）----
+ * desk  = 抽屉那张"桌子"（surfaceVariant 底，永远在下面）
+ * sheet = 主页内容（跟手 translateY 下移、顶部圆角随位移渐现、alpha 桌子渐入）
+ * 松手过半吸附展开、不过半弹回 —— 手势只从「主页头部」向下拉（手机端 nestedScroll
+ * 滚到顶才下拉的同款语义，也避免和块的拖拽排序打架）。
+ */
+.ph-desk {
+  position: absolute; inset: 0; z-index: 1;
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 12px 16px 10px;
+  background: var(--ph-drawer-bg);
+  opacity: 0; pointer-events: none;
+}
+.ph-sheet {
+  position: relative; z-index: 2; height: 100%;
+  overflow-y: auto; overscroll-behavior: contain;
+  background: var(--ph-sheet-bg);
+  display: flex; flex-direction: column; gap: 10px;
+  box-shadow: 0 -1px 0 rgba(0,0,0,.02);
+  will-change: transform;
+}
+.ph-sheet.anim { transition: transform .32s cubic-bezier(.2, .85, .25, 1), border-radius .32s; }
+.ph-home-head { display: flex; align-items: center; gap: 8px; cursor: grab; touch-action: none; }
+.ph-home-head:active { cursor: grabbing; }
+.ph-home-head .ph-date-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ph-home-head .ph-date { font-size: 15px; font-weight: 600; }
+.ph-home-head .ph-pull-hint { font-size: 10px; color: var(--ph-muted); }
+.ph-home-head .ph-edit-btn {
+  flex: 0 0 auto; font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  color: var(--ph-primary); cursor: pointer;
+}
+/* 抽屉桌子的内容（对照 AllFunctionsDrawer：标题 + 横滚 chips + 模块 4 列格 + 底部两按钮） */
+.ph-desk .ph-d-title { font-size: 13px; font-weight: 600; }
+.ph-desk .ph-d-chips { display: flex; gap: 8px; overflow-x: auto; }
+/* = DrawerEntryChip：圆角 10 + secondaryContainer 底 + 两行（图标行 / 标签行），横滚 */
+.ph-desk .ph-d-chip {
+  flex: 0 0 auto; display: flex; flex-direction: column; align-items: center;
+  padding: 6px 10px; border-radius: 10px;
+  background: var(--ph-secondary-container, var(--ph-card2)); cursor: pointer;
+}
+.ph-desk .ph-d-chip-ico { font-size: 15px; line-height: 1.2; white-space: nowrap; }
+.ph-desk .ph-d-chip-label { font-size: 10px; color: var(--ph-on-secondary-container, var(--ph-muted)); white-space: nowrap; }
+.ph-desk .ph-d-hint { font-size: 9px; color: var(--ph-muted); }
+.ph-desk .ph-d-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+.ph-desk .ph-d-item {
+  flex: 1 1 22%; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 8px 0; border-radius: 12px; font-size: 10px; cursor: pointer;
+}
+.ph-desk .ph-d-item .ph-nav-ico { margin: 0 auto; }
+.ph-desk .ph-d-btns { display: flex; gap: 8px; margin-top: auto; }
+.ph-desk .ph-d-btn {
+  flex: 1; text-align: center; font-size: 12px; padding: 6px 0; border-radius: 999px;
+  border: 1px solid var(--ph-card2); color: var(--ph-on-bg); cursor: pointer;
+}
+
+/* 卡片 / 行 / 胶囊 —— 手机端那套观感的公共部分 */
+.ph-card {
+  background: var(--ph-card); border-radius: var(--ph-radius); padding: 12px;
+  display: flex; flex-direction: column; gap: 7px;
+}
+.ph-card.hi { background: var(--ph-primary-container); color: var(--ph-on-primary-container); }
+.ph-row { display: flex; align-items: center; gap: 9px; }
+.ph-grow { flex: 1; min-width: 0; }
+.ph-t { font-size: calc(13px * var(--ph-fs)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-t.b { font-weight: 600; }
+.ph-m { font-size: calc(11px * var(--ph-fs)); color: var(--ph-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-badge {
+  font-size: calc(10px * var(--ph-fs)); padding: 2px 7px; border-radius: 999px;
+  background: var(--ph-card2); color: var(--ph-muted); white-space: nowrap;
+}
+.ph-badge.p { background: var(--ph-primary-container); color: var(--ph-on-primary-container); }
+.ph-badge.l { background: var(--ph-tertiary-container); }
+.ph-accent { width: 3px; border-radius: 999px; background: var(--ph-primary); align-self: stretch; }
+.ph-block {
+  border-radius: var(--ph-radius); padding: 10px 12px; font-size: calc(11px * var(--ph-fs));
+  background: var(--ph-primary-container); color: var(--ph-on-primary-container);
+}
+.ph-block.links { display: flex; flex-wrap: wrap; gap: 6px; }
+.ph-link { text-decoration: underline; }
+.ph-switch {
+  width: 38px; height: 22px; border-radius: 999px; background: var(--ph-card2); position: relative; flex: 0 0 auto;
+}
+.ph-switch.on { background: var(--ph-primary); }
+.ph-switch::after {
+  content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+  border-radius: 999px; background: #fff; transition: left .12s;
+}
+.ph-switch.on::after { left: 19px; }
+.ph-empty { color: var(--ph-muted); font-size: 11px; text-align: center; padding: 18px 0; }
+
+/* ---- 手机端默认卡片墙的原版样式（HomeWidgets.kt 逐段对照，v3.2）----
+ * WidgetCard：surface 底 + 标题(titleSmall Medium) + 右上 [查看/全部] TextButton + padding 14
+ * WeatherCard：surfaceVariant 底（和别的不一样！）+ 地点小灰字 + 大温度 + 12h 横滚格 + 5 天行
+ * MiniEventRow：8dp 色点 + hhmm(44dp) + 标题/地点两行
+ * OutlinedButton：整宽描边（「＋ 新建日程」那种）
+ */
+.ph-wx-head { display: flex; align-items: center; }
+.ph-wx-title { flex: 1; min-width: 0; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-more-btn { flex: 0 0 auto; font-size: 11px; padding: 2px 8px; border-radius: 999px; color: var(--ph-primary); cursor: pointer; }
+.ph-w-place { font-size: 10px; color: var(--ph-muted); }
+.ph-w-now { display: flex; align-items: flex-end; gap: 8px; }
+.ph-w-temp { font-size: 24px; font-weight: 500; line-height: 1.1; }
+.ph-w-desc { font-size: 14px; padding-bottom: 2px; }
+.ph-w-hours { display: flex; gap: 6px; overflow-x: auto; }
+.ph-w-hour { flex: 0 0 auto; text-align: center; border-radius: 10px; padding: 6px 10px; background: var(--ph-card2); font-size: 10px; display: flex; flex-direction: column; gap: 1px; }
+.ph-w-hour.rain { background: var(--ph-primary-container); color: var(--ph-on-primary-container); }
+.ph-w-day { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.ph-mini-row { display: flex; align-items: center; gap: 8px; padding: 5px 4px; border-radius: 8px; }
+.ph-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--ph-primary); flex: 0 0 auto; }
+.ph-mini-time { font-size: 11px; color: var(--ph-muted); flex: 0 0 40px; }
+.ph-mini-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ph-obtn {
+  width: 100%; text-align: center; font-size: 12px; padding: 5px 0; border-radius: 999px;
+  border: 1px solid var(--ph-card2); color: var(--ph-on-bg); cursor: pointer; background: transparent;
+}
+
+/* 底栏 64px（NavigationBar）—— 列尾即贴底 */
+.ph-nav {
+  position: relative; z-index: 1; flex: 0 0 64px; height: 64px;
+  display: flex; align-items: center;
+  background: var(--ph-nav-bg); padding: 0 6px 4px;
+}
+
+/* ---------------- 横屏外壳（v3.4：对照 LandscapeShell.kt 逐段移植） ----------------
+ * 横屏 = 左栏(84dp，原顶栏竖排) + 内容区 + 右栏(84dp，原底栏竖排，主页仍居中)。
+ * ⚠️ 默认底色和竖屏不同：左栏 topBarBg ?: **surface**（竖屏顶栏是 background）、
+ *    右栏 navBg ?: surface（与竖屏底栏一致）。
+ * 树状菜单从内容区顶部滑下（只盖内容区，不盖两栏 —— 两栏是"去别处"的唯一出口）。
+ */
+.ph.land { flex-direction: row; width: 852px; height: 393px; }
+.ph.land .ph-status, .ph.land .ph-top, .ph.land .ph-nav { display: none; }
+.ph.land .ph-content { flex: 1 1 auto; min-width: 0; height: auto; }
+.ph-leftrail, .ph-rightrail {
+  width: 84px; flex: 0 0 84px; z-index: 1; position: relative;
+  display: none; flex-direction: column; align-items: center;
+  padding: 8px 0; gap: 10px;
+}
+.ph.land .ph-leftrail, .ph.land .ph-rightrail { display: flex; }
+.ph-leftrail { background: var(--ph-rail-left-bg); }
+.ph-rightrail { background: var(--ph-rail-right-bg); gap: 6px; }
+.ph-rail-id { display: flex; flex-direction: column; align-items: center; line-height: 1.2; }
+.ph-rail-id .t { font-size: 16px; font-weight: 600; color: var(--ph-primary); }
+.ph-rail-id .s { font-size: 9px; color: var(--ph-muted); }
+.ph-rail-div { width: 56px; height: 1px; background: var(--ph-card2); }
+.ph-railbtn {
+  width: 72px; border-radius: 12px; padding: 6px 0; display: flex; flex-direction: column;
+  align-items: center; gap: 2px; cursor: pointer; text-align: center;
+}
+.ph-railbtn:hover { background: rgba(128, 128, 128, .08); }
+.ph-railbtn.on { background: var(--ph-primary-container); color: var(--ph-on-primary-container); }
+.ph-railbtn .ic { font-size: 17px; }
+.ph-railbtn .lb { font-size: 10px; color: var(--ph-muted); max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ph-railbtn.on .lb { color: var(--ph-on-primary-container); }
+.ph-rail-sub { font-size: 9px; color: var(--ph-muted); text-align: center; max-width: 76px; }
+.ph-rail-spring { flex: 1; }
+/* 树状菜单（TreeMenuHost：从内容区顶部滑下） */
+.ph-treemenu {
+  position: absolute; left: 0; right: 0; top: 0; z-index: 8;
+  background: var(--ph-card); border-radius: 0 0 14px 14px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .28);
+  padding: 10px 14px; max-height: 78%; overflow-y: auto;
+  transform: translateY(-102%); transition: transform .26s cubic-bezier(.2, .85, .25, 1);
+}
+.ph-treemenu.open { transform: none; }
+.ph-treemenu .tm-title { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+.ph-treemenu .tm-row { display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-radius: 8px; cursor: pointer; font-size: 12px; }
+.ph-treemenu .tm-row:hover { background: var(--ph-card2); }
+.ph-treemenu .tm-row.on { color: var(--ph-nav-sel); font-weight: 600; }
+.ph-nav-item {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  font-size: 10px; color: var(--ph-muted);
+}
+.ph-nav-item.on { color: var(--ph-nav-sel); font-weight: 600; }
+.ph-nav-ico {
+  width: calc(var(--ph-ico-size) * 1px); height: calc(var(--ph-ico-size) * 1px);
+  display: flex; align-items: center; justify-content: center;
+  font-size: calc(var(--ph-ico-size) * 0.72px);
+  background: var(--ph-icon-bg);
+}
+.ph-nav-ico.circle { border-radius: 999px; }
+.ph-nav-ico.rounded { border-radius: calc(9px * var(--ph-corner-mul)); }
+.ph-nav-ico.square { border-radius: 0; }
+
+/* 旧 .ph-drawer 样式已并入上面 v3.3 的 .ph-desk —— JS 也只再建 .ph-desk。 */
+
+/* ---------------- 画布点选（点哪个块就选中哪个） ---------------- */
+.ph[data-sel], .ph [data-sel] { position: relative; }
+.ph[data-sel]:hover, .ph [data-sel]:hover {
+  outline: 1px dashed rgba(91, 157, 255, .55); outline-offset: 1px; cursor: pointer;
+}
+.ph[data-sel].sel-on, .ph [data-sel].sel-on { outline: 2px solid var(--ss-accent); outline-offset: 1px; }
+.ph[data-sel].sel-on::after, .ph [data-sel].sel-on::after {
+  content: attr(data-sel-label);
+  position: absolute; right: 5px; top: 3px; z-index: 6;
+  background: var(--ss-accent); color: #06101f;
+  font-size: 9px; font-weight: 700; line-height: 1;
+  padding: 3px 6px; border-radius: 999px; pointer-events: none; white-space: nowrap;
+}
+/* 整机级别的选中（配色/纹理）角标放右下角，别盖住状态栏 */
+.ph.sel-on::after { top: auto; bottom: 76px; right: 12px; }
+
+/* ---------------- 块画布（主页） ---------------- */
+.ph-home { display: flex; flex-wrap: wrap; align-content: flex-start; }
+.ss-blk {
+  position: relative;
+  border: 1px dashed transparent; border-radius: 12px;
+  cursor: grab; user-select: none;
+  min-height: 44px;
+  padding: 10px;
+  display: flex; flex-direction: column; gap: 4px; justify-content: center;
+  background: var(--ph-card); color: var(--ph-on-bg);
+}
+.ss-blk:hover { border-color: rgba(91, 157, 255, .5); }
+.ss-blk.dragging { opacity: .35; }
+.ss-blk .ss-blk-h { font-size: 13px; font-weight: 600; }
+.ss-blk .ss-blk-p { font-size: 11px; color: var(--ph-muted); }
+.ss-blk .ss-blk-meta { font-size: 9px; color: var(--ph-muted); }
+/* 留白：看得见的虚线框，拖拽/定位才有目标 */
+.ss-blk.t-spacer { background: transparent; border: 1px dashed var(--ph-card2); justify-content: center; align-items: center; }
+/* 分隔线：贴中一条线 */
+.ss-blk.t-divider { background: transparent; border: none; padding: 0; min-height: 10px; justify-content: center; }
+.ss-blk.t-divider .ss-blk-line { height: 1px; width: 100%; background: var(--ph-muted); opacity: .6; }
+/* HTML 块：代码底色的预览框 */
+.ss-blk.t-html { background: #14171d; border: 1px solid var(--ph-card2); font: 10px/1.4 ui-monospace, Menlo, monospace; color: #9fe6b8; overflow: hidden; }
+/* widget 块 */
+.ss-blk.t-widget { min-height: 84px; justify-content: center; }
+/* 主页还没开始设计时的空态卡 */
+.ss-home-empty {
+  border: 1px dashed var(--ph-card2); border-radius: var(--ph-radius);
+  padding: 18px 14px; text-align: center; color: var(--ph-muted); font-size: 11px;
+  display: flex; flex-direction: column; gap: 8px; align-items: center;
+}
+.ss-home-empty button {
+  background: var(--ph-primary); color: var(--ph-on-primary); border: none;
+  border-radius: 999px; padding: 6px 14px; font-size: 12px; cursor: pointer;
+}
+
+/* ---------------- 页面块（top / bottom 两个可编辑区） ---------------- */
+.ph-pzone { display: flex; flex-direction: column; gap: 6px; }
+.ss-pblk {
+  position: relative; cursor: grab; user-select: none;
+  border-radius: calc(10px * var(--ph-corner-mul));
+  padding: 8px 10px; font-size: calc(11px * var(--ph-fs));
+  background: var(--ph-primary-container); color: var(--ph-on-primary-container);
+  border: 1px dashed transparent;
+}
+.ss-pblk:hover { border-color: rgba(91, 157, 255, .5); }
+.ss-pblk.dragging { opacity: .35; }
+.ss-pblk .ss-pblk-ico { margin-right: 6px; }
+.ss-pblk.k-heading { background: transparent; border: none; padding: 2px 4px; font-weight: 600; font-size: calc(14px * var(--ph-fs)); }
+.ss-pblk.k-text { background: var(--ph-card); color: var(--ph-on-bg); }
+.ss-pblk.k-actions, .ss-pblk.k-links { background: var(--ph-card); color: var(--ph-on-bg); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ss-pblk.k-links .ss-chip2 { text-decoration: underline; }
+.ss-chip2 {
+  border-radius: 999px; padding: 2px 9px; font-size: 10px;
+  background: var(--ph-card2); color: var(--ph-muted); white-space: nowrap;
+}
+.ss-pblk.k-divider { background: transparent; border: none; padding: 0; min-height: 6px; }
+.ss-pblk.k-divider .ss-blk-line { height: 1px; width: 100%; background: var(--ph-muted); opacity: .6; }
+.ss-pblk.k-card { background: var(--ph-card); color: var(--ph-on-bg); display: flex; flex-direction: column; gap: 6px; }
+
+/* 中间的"插件内容"占位标签 */
+.ph-slotnote { font-size: 9px; color: var(--ph-muted); text-align: center; padding: 1px 0; opacity: .8; }
+
+/* 加块按钮 */
+.ss-addblk {
+  border: 1px dashed var(--ph-card2); border-radius: calc(10px * var(--ph-corner-mul));
+  background: transparent; color: var(--ph-muted); font-size: 11px;
+  padding: 5px 10px; cursor: pointer; text-align: center;
+}
+.ss-addblk:hover { border-color: var(--ss-accent); color: var(--ss-accent); }
+
+/* ---------------- 拖放指示 ---------------- */
+.ss-blk.ss-drop-before { box-shadow: -3px 0 0 0 var(--ss-accent); }
+.ss-pblk.ss-drop-before { box-shadow: 0 -3px 0 0 var(--ss-accent); }
+.ph-home.ss-drop-end { outline: 2px dashed var(--ss-accent); outline-offset: 2px; }
+.ph-pzone.ss-drop-end { outline: 2px dashed var(--ss-accent); outline-offset: 2px; }
+
+/* ---------------- 块类型菜单（加块时弹出） ---------------- */
+.ss-menu {
+  position: fixed; z-index: 90; min-width: 130px;
+  background: var(--ss-panel2); border: 1px solid var(--ss-line); border-radius: 10px;
+  padding: 4px; display: flex; flex-direction: column; gap: 2px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .5);
+}
+.ss-menu button { text-align: left; padding: 6px 10px; font-size: 12px; border: none; background: transparent; }
+.ss-menu button:hover { background: rgba(91, 157, 255, .14); }
+.ss-menu button:disabled { opacity: .4; cursor: default; }
+.ss-menu button:disabled:hover { background: transparent; }
+
+/* ---------------- 发布模态 ---------------- */
+.ss-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; }
+.ss-modal[hidden] { display: none; }
+.ss-modal-mask { position: absolute; inset: 0; background: rgba(4, 6, 10, .62); }
+.ss-modal-box {
+  position: relative; width: min(640px, calc(100vw - 48px)); max-height: calc(100vh - 80px);
+  display: flex; flex-direction: column;
+  background: var(--ss-panel); border: 1px solid var(--ss-line); border-radius: 14px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, .5);
+}
+.ss-modal-h {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--ss-line);
+}
+.ss-modal-h b { font-size: 14px; }
+.ss-modal-b { padding: 12px 14px; overflow-y: auto; }
+.ss-code {
+  font: 11px/1.5 ui-monospace, Menlo, monospace; background: var(--ss-panel2);
+  border: 1px solid var(--ss-line); border-radius: 8px; padding: 8px;
+  max-height: 190px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+}
+.ss-code-big {
+  font: 600 15px/1.4 ui-monospace, Menlo, monospace; letter-spacing: .04em;
+  background: var(--ss-panel2); border: 1px dashed var(--ss-accent); color: #cfe2ff;
+  border-radius: 10px; padding: 10px; text-align: center; user-select: all; margin: 6px 0;
+}
+
+/* ---------------- toast ---------------- */
+.ss-toasts {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 6px; z-index: 95; align-items: center;
+}
+.ss-toast {
+  background: #232833; color: var(--ss-text); border: 1px solid var(--ss-line);
+  border-radius: 10px; padding: 8px 14px; font-size: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.4);
+  animation: ss-up .16s ease-out;
+}
+.ss-toast.ok { border-color: #2c5f3f; color: #b8f0cd; }
+.ss-toast.bad { border-color: #6b2b2b; color: #ffc0c0; }
+@keyframes ss-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* ============================================================================
+   v5（2026-10-15）：自由画布模式的接线
+   —— 顶栏的模式切换 + 页面选择器 + 中栏换成画布 + 代码模态。
+   画布本身的样子在 free-canvas.css，这里只管"把它放进三栏里"。
+   ============================================================================ */
+
+/* ⚠️ 必须有：`.ss-stage` 自己带 `display:flex`，而 `[hidden]` 的
+   `display:none` 优先级比类选择器低 —— 不加这条，切到自由画布时
+   手机模拟器**还在下面撑着**（看起来像"两套画布叠一起"）。 */
+[hidden] { display: none !important; }
+
+/* 模式切换 */
+.ss-modes { display: inline-flex; background: var(--ss-panel2); border: 1px solid var(--ss-line); border-radius: 9px; padding: 2px; }
+.ss-modebtn {
+  padding: 4px 11px; border: 0; border-radius: 7px; cursor: pointer;
+  background: transparent; color: var(--ss-muted);
+  font: 12px/1.4 -apple-system, "Noto Sans SC", system-ui, sans-serif;
+}
+.ss-modebtn:hover { color: var(--ss-text); }
+.ss-modebtn.on { background: var(--ss-accent); color: #08121f; font-weight: 600; }
+
+/* 页面选择器 */
+.ss-pagesel {
+  padding: 4px 8px; border-radius: 8px; cursor: pointer; max-width: 130px;
+  background: var(--ss-panel2); color: var(--ss-text); border: 1px solid var(--ss-line);
+  font: 12px/1.4 -apple-system, "Noto Sans SC", system-ui, sans-serif;
+}
+
+/* 中栏：画布容器（撑满 .ss-mid） */
+/* ⚠️ `position:relative` 是给预览浮层用的（`.fc-pvwrap` 是 `inset:0`，
+   没有定位祖先的话它会相对整个页面铺开，把顶栏也盖住）。 */
+#fc-mid { position: relative; height: 100%; min-height: 0; display: flex; flex-direction: column; }
+#fc-canvas { flex: 1; min-height: 0; }
+
+/* 自由模式下的左栏：元素库 + 图层 */
+#fc-left { display: block; }
+#fc-left .fc-layer + .fc-layer { margin-top: 2px; }
+
+/* 代码模态 */
+.fc-codebox { width: min(920px, 94vw); height: min(80vh, 760px); display: flex; flex-direction: column; }
+.fc-codebox .ss-modal-b { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+#fc-code-ta {
+  flex: 1; min-height: 0; resize: none; padding: 12px; border-radius: 10px;
+  background: #0b0d11; color: #d7dde8; border: 1px solid var(--ss-line);
+  font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace; white-space: pre; tab-size: 2;
+}
+#fc-code-ta:focus { outline: none; border-color: var(--ss-accent); }
+.fc-codenote { margin: 8px 0 0; font-size: 11px; color: var(--ss-muted); line-height: 1.7; }
+.fc-codeacts { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+
+/* v5 右键菜单：分隔线 + 危险项（自由画布的层级/删除那几项要用） */
+.ss-menu-sep { height: 1px; margin: 4px 6px; background: var(--ss-line); }
+.ss-menu button.danger:hover { background: rgba(229, 72, 77, .22); color: #ff9a9f; }
+
+/* v5 预览浮层：盖在画布上按"真机那套"跑一遍（动作会触发，只是打印出来） */
+.fc-pvwrap {
+  position: absolute; inset: 0; z-index: 60;
+  display: flex; flex-direction: column;
+  background: rgba(10, 12, 16, .93);
+}
+.fc-pvbar {
+  display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+  border-bottom: 1px solid var(--ss-line); color: var(--ss-muted); font-size: 12px;
+}
+.fc-pvbar .ss-icobtn { margin-left: auto; }
+.fc-pvbody {
+  flex: 1; min-height: 0; overflow: auto;
+  display: flex; align-items: flex-start; justify-content: center; padding: 20px;
+}

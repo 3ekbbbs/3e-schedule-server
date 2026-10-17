@@ -58,6 +58,7 @@ const S = {
   distTab: 'updates',
   maintTab: 'backup',
   logs: { kind: 'server', lines: 300, timer: null },
+  plugins: [],
   busy: false,
 };
 
@@ -237,6 +238,15 @@ async function boot() {
   $('#app').hidden = false;
   $('#who').textContent = st.session.name || '';
   updateTop();
+  // 插件列表决定侧边栏多出哪几项。拉不到不影响面板本身 ——
+  // 最坏情况是"插件入口没出现"，而不是整页打不开。
+  try {
+    await loadPlugins();
+  } catch (e) {
+    console.warn('plugins failed', e);
+    S.plugins = [];
+  }
+  applyPluginNav();
   if (!location.hash) location.hash = '#/overview';
   navigate();
 }
@@ -349,6 +359,7 @@ const PAGE_TITLE = {
   moderation: '内容审核',
   distribution: '分发',
   maintenance: '维护',
+  plugins: '插件',
   settings: '设置',
 };
 
@@ -361,6 +372,8 @@ async function navigate() {
   $('#pageTitle').textContent = PAGE_TITLE[page];
   $$('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.page === page));
   const view = $('#view');
+  // 插件页整块给 iframe，去掉内容区留白与最大宽度。
+  view.classList.toggle('flush', page.indexOf('plugin/') === 0);
   view.innerHTML = '<div class="empty">加载中…</div>';
   try {
     const mod = PAGES[page];
@@ -1703,14 +1716,44 @@ async function renderBackup() {
         <tbody>${rows}</tbody></table></div>
 
       <div style="border-top:1px solid var(--border);margin:20px -18px 0;padding:18px">
-        <h3 style="margin:0 0 8px;font-size:14px">恢复数据库</h3>
+        <h3 style="margin:0 0 8px;font-size:14px">从旧版本迁移 / 从备份恢复</h3>
         <div class="alert warn" style="margin-bottom:12px">
-          恢复会停掉服务、替换当前数据库并重新启动。当前库会另存为 <span class="mono">schedule.db.bak-时间</span>。
+          换库期间服务会停几秒。<b>换之前会自动做两份备份</b>：当前库进
+          <span class="mono">backups/pre-migrate-时间.db</span>，你传上来的这份进
+          <span class="mono">backups/imported-时间.db</span>。换错了可以拿回来。
         </div>
-        <input type="file" id="restoreFile" accept=".db">
-        <div class="row" style="margin-top:12px"><button class="btn danger" data-act="restore">上传并恢复</button></div>
+        <p class="small muted" style="margin:0 0 10px;line-height:1.8">
+          旧服务器上先停掉服务，把 <span class="mono">data/schedule.db</span> 复制过来
+          （同目录如果有 <span class="mono">-wal</span> / <span class="mono">-shm</span>，一起传）。
+          <b>先点「体检」</b>：它只读文件、不动数据，会告诉你里面有多少账号和日程。
+        </p>
+        <input type="file" id="migrateFile" accept=".db">
+        <div class="row" style="margin-top:12px">
+          <button class="btn" data-act="migrate-check">体检</button>
+          <button class="btn danger" data-act="migrate-run" disabled>确认迁移</button>
+        </div>
+        <pre class="log" id="migrateOut" style="display:none;margin-top:12px"></pre>
       </div>
     </div>`;
+}
+
+function statsText(s) {
+  if (!s) return '';
+  const span = (a, b) => {
+    if (!a || !b) return '—';
+    return fmtTime(a).slice(0, 10) + ' ~ ' + fmtTime(b).slice(0, 10);
+  };
+  return [
+    '账号：' + s.users,
+    '日历：' + s.calendars,
+    '日程：' + s.events,
+    '设备：' + s.devices,
+    '提醒：' + s.reminders,
+    '日程时间范围：' + span(s.first_event, s.last_event),
+    '文件大小：' + fmtBytes(s.size),
+    '',
+    s.schema_note,
+  ].join('\n');
 }
 
 function renderRepair(st) {
@@ -1811,17 +1854,68 @@ async function mountMaintenance() {
         await navigate();
         return;
       }
-      if (act === 'restore') {
-        const file = $('#restoreFile').files[0];
+      if (act === 'migrate-check') {
+        const file = $('#migrateFile').files[0];
         if (!file) { toast('请选择 .db 文件', 'err'); return; }
-        if (!(await confirmBox({ title: '恢复数据库', text: '服务会短暂停止，当前数据会被替换。', danger: true, ok: '恢复' }))) return;
         const fd = new FormData();
         fd.append('db', file);
         btn.disabled = true;
-        const r = await req('/api/panel/restore', { method: 'POST', body: fd });
-        toast('恢复完成，服务已重启', 'ok');
-        console.log(r);
-        await navigate();
+        btn.textContent = '体检中…';
+        try {
+          const r = await req('/api/panel/restore?dry=1', { method: 'POST', body: fd });
+          S.migrateStats = r.stats;
+          const out = $('#migrateOut');
+          out.style.display = 'block';
+          out.textContent = statsText(r.stats);
+          const run = document.querySelector('[data-act="migrate-run"]');
+          if (run) run.disabled = false;
+          toast('体检完成。数字对得上再点「确认迁移」', 'ok');
+        } catch (e) {
+          fail(e);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '体检';
+        }
+        return;
+      }
+      if (act === 'migrate-run') {
+        const file = $('#migrateFile').files[0];
+        if (!file) { toast('文件没了，请重新选择 .db', 'err'); return; }
+        const s = S.migrateStats || {};
+        const ok = await confirmBox({
+          title: '确认迁移',
+          text: `将要导入：账号 ${s.users}，日历 ${s.calendars}，日程 ${s.events}。\n\n`
+            + '当前库会先备份，服务会停几秒。',
+          danger: true,
+          ok: '开始迁移',
+        });
+        if (!ok) return;
+        const fd = new FormData();
+        fd.append('db', file);
+        btn.disabled = true;
+        btn.textContent = '迁移中…';
+        try {
+          const r = await req('/api/panel/restore', { method: 'POST', body: fd });
+          const out = $('#migrateOut');
+          out.style.display = 'block';
+          const lines = [];
+          if (r.before) lines.push('迁移前（这台机器上一份，已备份）：\n' + statsText(r.before));
+          if (r.source) lines.push('导入源：\n' + statsText(r.source));
+          if (r.after) lines.push('迁移后：\n' + statsText(r.after));
+          if (r.mismatch && r.mismatch.length) lines.push('对不上的地方（导入源 vs 迁移后）：\n' + r.mismatch.join('\n'));
+          if (r.note) lines.push(r.note);
+          if (r.backup) lines.push('原库备份：' + r.backup);
+          if (r.imported) lines.push('迁移源留档：' + r.imported);
+          lines.push('旧登录令牌已经失效。请用迁移过来的管理员账号重新登录。');
+          out.textContent = lines.join('\n\n');
+          const bad = r.mismatch && r.mismatch.length;
+          toast(bad ? '迁移完成，但前后数字对不上，看下面的明细' : '迁移完成', bad ? 'err' : 'ok');
+        } catch (e) {
+          fail(e);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '确认迁移';
+        }
         return;
       }
       if (act === 'scan') { log(await sget('/api/maintenance/scan')); return; }
@@ -2013,6 +2107,219 @@ async function mountSettings() {
   };
 }
 
+// ---------------------------------------------------------------- 插件
+
+async function loadPlugins() {
+  const d = await pget('/plugins');
+  S.plugins = (d && d.plugins) || [];
+  return S.plugins;
+}
+
+const pluginKey = (id) => 'plugin/' + id;
+
+function pluginFrameHTML(p) {
+  const entry = String(p.entry || 'index.html').replace(/"/g, '%22');
+  return `<iframe class="plugin-frame" src="/plugin/${encodeURIComponent(p.id)}/${entry}" title="${esc(p.name || p.id)}"></iframe>`;
+}
+
+// applyPluginNav 把"装了且开着"的插件挂到侧边栏，并注册对应的页面。
+//
+// 为什么每次都整块重建：插件的装卸是不重启面板就生效的，
+// 增量地加/删最容易在"卸载了但链接还在"这种地方留下死入口。
+function applyPluginNav() {
+  const nav = $('#nav');
+  if (!nav) return;
+  Array.from(nav.querySelectorAll('[data-plugin-nav]')).forEach((el) => el.remove());
+
+  const live = S.plugins.filter((p) => p.installed && p.enabled && !p.broken);
+
+  // 先清掉已经不成立的页面，再注册当前的 —— 顺序反了会把自己刚注册的删掉。
+  Object.keys(PAGE_TITLE).forEach((k) => {
+    if (k.indexOf('plugin/') === 0 && !live.some((p) => pluginKey(p.id) === k)) {
+      delete PAGE_TITLE[k];
+      delete PAGES[k];
+    }
+  });
+  live.forEach((p) => {
+    PAGE_TITLE[pluginKey(p.id)] = p.name || p.id;
+    PAGES[pluginKey(p.id)] = { render: async () => pluginFrameHTML(p) };
+  });
+
+  if (!live.length) return;
+
+  const sep = document.createElement('div');
+  sep.className = 'nav-sep';
+  sep.dataset.pluginNav = '1';
+  sep.textContent = '插件';
+  nav.appendChild(sep);
+
+  live.forEach((p) => {
+    const a = document.createElement('a');
+    a.href = '#/' + pluginKey(p.id);
+    a.dataset.page = pluginKey(p.id);
+    a.dataset.pluginNav = '1';
+    a.innerHTML = `<span class="ico">${esc(p.icon || '🧩')}</span>${esc(p.name || p.id)}`;
+    nav.appendChild(a);
+  });
+}
+
+const pluginMeta = (p) => {
+  const bits = [];
+  if (p.version) bits.push('v' + p.version);
+  if (p.publisher) bits.push(p.publisher);
+  if (p.source === 'builtin') bits.push('随程序附带');
+  else if (p.source === 'upload') bits.push('手动上传');
+  if (p.installed_at) bits.push('装于 ' + fmtTime(p.installed_at));
+  return bits.join(' · ');
+};
+
+function pluginRow(p) {
+  const state = p.broken
+    ? '<span class="badge bad">包是坏的</span>'
+    : p.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge neutral">已停用</span>';
+  const actions = p.installed
+    ? `${!p.broken && p.enabled ? `<button class="btn sm" data-act="plugin-open" data-id="${esc(p.id)}">打开</button>` : ''}
+       <button class="btn sm" data-act="plugin-toggle" data-id="${esc(p.id)}" data-next="${p.enabled ? '0' : '1'}">${p.enabled ? '停用' : '启用'}</button>
+       <button class="btn sm danger" data-act="plugin-del" data-id="${esc(p.id)}" data-name="${esc(p.name || p.id)}">卸载</button>`
+    : `<button class="btn sm primary" data-act="plugin-install" data-id="${esc(p.id)}">安装</button>`;
+
+  return `<div class="plugin-row">
+    <div class="plugin-ico">${esc(p.icon || '🧩')}</div>
+    <div class="plugin-main">
+      <div class="plugin-name">${esc(p.name || p.id)} ${state}</div>
+      <div class="plugin-desc">${esc(p.description || '这个插件没有写说明。')}</div>
+      <div class="plugin-meta">${esc(pluginMeta(p))}</div>
+      ${p.broken ? `<div class="plugin-meta" style="color:var(--danger)">读不出 manifest.json：${esc(p.broken)}</div>` : ''}
+    </div>
+    <div class="plugin-actions">${actions}</div>
+  </div>`;
+}
+
+async function renderPlugins() {
+  const list = await loadPlugins();
+  applyPluginNav();
+  const installed = list.filter((p) => p.installed);
+  const available = list.filter((p) => !p.installed);
+
+  const installedBody = installed.length
+    ? installed.map(pluginRow).join('')
+    : '<div class="empty">还没有装任何插件。下面有随程序附带的两个，点「安装」就能用。</div>';
+
+  const availableBody = available.length
+    ? available.map(pluginRow).join('')
+    : '<div class="empty">随程序附带的插件都已经装上了。</div>';
+
+  return `
+    ${card('已安装', installedBody, { tight: true })}
+    ${card('随程序附带', availableBody, {
+      tight: true,
+      sub: '文件已经在程序里，安装之后才占用运行资源',
+    })}
+    ${card('从文件安装', `
+      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+        <input type="file" id="pluginZip" accept=".zip,application/zip">
+        <button class="btn primary" data-act="plugin-upload">安装</button>
+      </div>
+      <div class="small muted" style="margin-top:10px;line-height:1.7">
+        zip 包里要有一份 <code>manifest.json</code>（id / name / version / entry）。
+        插件跑在面板的源上，权限等同于面板本身 —— 只装你信任的来源。
+      </div>
+    `, {})}
+    ${card('插件能做什么', `
+      <div class="small muted" style="line-height:1.8">
+        插件是面板里的独立页面，用来放「只有一部分人用得上」的工具。
+        现在随程序带的是导航标注台与外观标注台，都带数据包分发：
+        标完的东西直接从面板发出去，用户在客户端输一个授权码就能导入。
+      </div>
+    `, {})}
+  `;
+}
+
+function mountPlugins() {
+  const view = $('#view');
+  if (!view || view.dataset.pluginBound === '1') return;
+  view.dataset.pluginBound = '1';
+
+  view.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    const id = btn.dataset.id;
+
+    if (act === 'plugin-open') {
+      location.hash = '#/' + pluginKey(id);
+      return;
+    }
+    if (act === 'plugin-install') {
+      btn.disabled = true;
+      try {
+        await ppost('/plugins/install-builtin', { id });
+        toast('已安装', 'ok');
+        await navigate();
+      } catch (e) {
+        fail(e);
+        btn.disabled = false;
+      }
+      return;
+    }
+    if (act === 'plugin-toggle') {
+      const enabled = btn.dataset.next === '1';
+      btn.disabled = true;
+      try {
+        await ppost(`/plugins/${encodeURIComponent(id)}/toggle`, { enabled });
+        toast(enabled ? '已启用' : '已停用', 'ok');
+        await navigate();
+      } catch (e) {
+        fail(e);
+        btn.disabled = false;
+      }
+      return;
+    }
+    if (act === 'plugin-del') {
+      if (!(await confirmBox({
+        title: '卸载插件',
+        text: `卸载「${btn.dataset.name || id}」会把它的文件从数据目录删掉。数据包（已发布的 navpack / skinpack）不受影响。`,
+        danger: true,
+        ok: '卸载',
+      }))) return;
+      btn.disabled = true;
+      try {
+        await req(`/api/panel/plugins/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        toast('已卸载', 'ok');
+        if (location.hash === '#/' + pluginKey(id)) location.hash = '#/plugins';
+        await navigate();
+      } catch (e) {
+        fail(e);
+        btn.disabled = false;
+      }
+      return;
+    }
+    if (act === 'plugin-upload') {
+      const input = $('#pluginZip');
+      const file = input && input.files && input.files[0];
+      if (!file) {
+        toast('先选一个 .zip 插件包', 'err');
+        return;
+      }
+      const fd = new FormData();
+      fd.append('zip', file);
+      btn.disabled = true;
+      btn.textContent = '安装中…';
+      try {
+        const { res, data } = await raw('/api/panel/plugins/upload', { method: 'POST', body: fd });
+        if (!res.ok) throw new Error((data && (data.error || data.message)) || '安装失败');
+        toast('已安装：' + ((data && data.id) || ''), 'ok');
+        await navigate();
+      } catch (e) {
+        fail(e);
+        btn.disabled = false;
+        btn.textContent = '安装';
+      }
+    }
+  });
+}
+
+
 // ---------------------------------------------------------------- 页面表
 
 const PAGES = {
@@ -2022,6 +2329,7 @@ const PAGES = {
   moderation: { render: renderModeration, mount: mountModeration },
   distribution: { render: renderDistribution, mount: mountDistribution },
   maintenance: { render: renderMaintenance, mount: mountMaintenance },
+  plugins: { render: renderPlugins, mount: mountPlugins },
   settings: { render: renderSettings, mount: mountSettings },
 };
 

@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <!--
+    ===========================================================================
+    导航标注台 · 本机工具（2026-10-12）
+    ===========================================================================
+
+    ## 它是干什么的
+
+    给**管理员/包作者**用的：在一张腾讯地图上点几下，把学校/园区里的楼
+    标上坐标，然后导出成一个 `.navpack.json` 文件（格式见
+    `docs/格式-导航数据包-navpack-2026-10-12.md`）。
+
+    导出的文件有两个去处：
+      · 上传到管理台 → 生成授权码 → 用户凭码一键导入；
+      · 直接发给别人，他用插件的「从文件导入」装上。
+
+    ## ★ 关于"本机打开"还是"线上打开"
+
+    两种都行，但要知道区别：
+
+      · **本机打开**（双击文件 / `file://`）：只有你自己看得见，地图 Key
+        不会暴露给任何第三方。代价是有些浏览器会限制剪贴板、文件下载
+        这类功能（Chrome / Edge 基本没问题）。
+      · **线上打开**（`https://threees.cn:8444/nav-studio.html`）：功能最完整。
+        因为这一页**不带任何用户数据、也不带任何密钥**（Key 是你现场填、
+        只进 localStorage 的），所以挂在公网上不会泄露什么。
+
+    ⚠️⚠️ **地址必须带 `:8444`，主机名必须是没有 `app.` 的那个。**
+       这不是口味问题，两个都踩过坑：
+
+         ✗ `https://threees.cn/nav-studio.html`（不带端口）
+           → 落到官网那个单页应用上，**所有**路径都返回同一张首页
+             （11933 字节）。页面能打开，但这**不是**标注台，
+             进去只会看到官网首页 —— 曾经有人因此以为"这页永远打不开"。
+
+         ✗ `https://app.threees.cn:8444/...`（带 `app.`）
+           → 页面是对的，但服务器那张证书（TrustAsia，SAN 只签了
+             `threees.cn` 和 `www.threees.cn`）**不覆盖 `app.` 子域**，
+             浏览器会弹"证书名称不匹配"。用户看到的是一屏安全警告，
+             很容易误判成"这个工具坏了"。
+
+         ✓ `https://threees.cn:8444/nav-studio.html`
+           → 服务器在这个口上确实伺服着标注台（11783 字节），
+             且主机名在证书 SAN 里，**没有任何警告**。
+
+       判断办法（一行就够）：打开 F12，看源码里有没有
+       `nsLoadMapApi` 这个函数名。有 = 是标注台；没有 = 你落在官网首页了。
+
+    ⚠️ 唯一要守的是：**地图 Key 永远不进仓库、不进任何页面源码**。
+       它只在你这台机器的浏览器里。
+
+    ## ★★ CSP 说明（2026-10-12 三次放宽：`mapstyle.qpic.cn` 没放行）
+
+    这一页**故意放宽了 CSP**，因为腾讯地图 GL SDK 不是"塞个 script 标签"
+    就能跑起来的东西。这是本机工具，不承载任何用户数据、也不接受外部输入，
+    所以只在这一页放宽。**不要**把这个 CSP 抄到 index.html / admin.html 去
+    —— 那两页不加载地图，没有放宽的理由。
+
+    ### 第一次为什么不够
+
+    症状：`new TMap.Map(...)` 直接抛异常，消息是 CSP 的
+    "…'unsafe-eval' is not an allowed source of script"。抛在 SDK 内部
+    （2.2MB 的 bundle），不是我们的代码 —— 我们那层只是把它 catch 下来
+    显示成"建图直接抛了异常"。
+
+    对 `https://map.qq.com/api/gljs?v=1.exp` 那份 bundle 逐条取证后，
+    下面每一条放开都有依据，不是"多写几个域保险"：
+
+      · `script-src 'unsafe-eval'`
+        bundle 里有 4 处 `Function` 构造。**模板引擎那处没有 try/catch
+        兜底**（`new Function("obj","strip", …)`），CSP 下必抛 EvalError；
+        另外三处（webpack 的 `new Function("return this")`、无 JSON 时的
+        `JSON.parse` 兜底）都有 catch。所以这条是硬需求，不是可选。
+      · `worker-src blob:`
+        SDK 用 `URL.createObjectURL(Blob)` 造出 worker 脚本，再
+        `new window.Worker(blobUrl)`（瓦片解析 worker，mapbox-gl 血统）。
+        缺这条 worker 建不起来 —— 表现是地图能出来但瓦片一直空。
+      · `mapapi.qq.com`（script / img / connect 三处都要）
+        SDK 里 18 处硬编码：glyph 图集 PNG（label 渲染要用它）、
+        logo、draco/basis 解码器（three-137）。⚠️ 它和 `apis.map.qq.com`
+        **是两个不同的域**，别以为写一个就够。
+      · `*.gtimg.com`（img / connect）
+        矢量瓦片 `rt0~rt3.map.gtimg.com/tile`、卫星瓦片
+        `p0~p3.map.gtimg.com/sateTiles`。
+      · `*.map.qq.com`（connect）
+        `vectorsdk.map.qq.com`（icon/style JSON）、`confinfo.map.qq.com`、
+        `sdkgw.map.qq.com` 等子域。
+      · `style-src blob:`
+        SDK 自带的 CSS 走 style-loader，存在 `<link href="blob:…">` 注入路径。
+
+    ### ★★ 第二次为什么还不够（用户报「打开还是一片白」）
+
+    症状（用户贴的 console）：**地图全白 + 控制台刷屏**：
+
+    ```
+      Connecting to 'https://mapstyle.qpic.cn/…' violates the following
+      Content Security Policy directive: "connect-src …"
+      … 未知错误：获取样式文件失败。
+    ```
+
+    **`mapstyle.qpic.cn` 没在 `connect-src` 里** —— SDK 拿不到它的**样式文件**，
+    于是瓦片永远加载不出来、地图永远空白。而这一条**和 Key 完全无关**：
+    换成再正确的 Key 也一样白。
+
+    ⚠️ 这个域**静态扫不出来**。把 2.2MB 的 bundle 全量扫一遍主机名，
+    里面只有 `*.map.qq.com` / `*.map.gtimg.com` / `mapapi.qq.com` /
+    `apis.map.qq.com` —— **`mapstyle.qpic.cn` 一次都没出现**。
+    它是 SDK 在运行时从**服务端下发的配置**里拿到的地址。
+
+    所以这次不再"看到一个补一个"，而是**按域名族放开**：
+
+      · `https://*.qpic.cn`  ← 本次缺的那一族（`mapstyle.qpic.cn` 在里面）
+      · `https://*.qq.com`   ← 兜底：上面那些具体域都是它的子域
+
+    ⚠️ 保留具体域名**不是为了 CSP**（`*.qq.com` 已经覆盖它们），而是为了
+    **留一份取证记录** —— 下次有人问"为什么要放开这些"，看这段就知道
+    每一条是从 bundle 的哪一处来的。真正的安全网是那两个族通配符：
+    腾讯把某个接口换到同族另一个域时，不会再来一次"一片空白"。
+
+    ### 还有一道运行时防线（比 CSP 本身更重要）
+
+    即使这里又漏了某个域，`nav-studio.js` 现在会监听
+    `securitypolicyviolation` 事件 —— 一旦 CSP 挡了任何东西，界面会**直接
+    说出被挡的是哪个域、哪条指令**，而不是给你一片白。
+    这条见 `nsWatchCsp()`。
+
+    ⚠️ 本机装了 Kaspersky 的话，它会把 `me.kis.v2.scr.kaspersky-labs.com`
+       自己**加进**这份 CSP 的 `script-src`（F12 里看到的那串就是它干的）。
+       那是它的正常行为，不影响下面这些条目，**也不用去删**。
+
+    ## 零依赖
+
+    不用框架、不用构建。一个 .html + 一个 .js + 一小段样式。
+    理由和 `admin.html` 一样：本机工具的生命周期很长（可能半年才用一次），
+    而任何构建产物都会在那时候过期（node_modules 没了、依赖升级了）。
+    ===========================================================================
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none';
+                 script-src 'self' 'unsafe-inline' 'unsafe-eval' https://map.qq.com https://*.map.qq.com https://mapapi.qq.com https://apis.map.qq.com https://*.qq.com https://*.qpic.cn;
+                 style-src 'self' 'unsafe-inline' blob: https://map.qq.com https://*.map.qq.com https://*.qq.com https://*.qpic.cn;
+                 img-src 'self' data: blob: https://map.qq.com https://*.map.qq.com https://mapapi.qq.com https://apis.map.qq.com https://*.gtimg.com https://*.qq.com https://*.qpic.cn;
+                 font-src 'self';
+                 connect-src 'self' https://map.qq.com https://*.map.qq.com https://mapapi.qq.com https://apis.map.qq.com https://*.gtimg.com https://*.qq.com https://*.qpic.cn;
+                 worker-src blob:;
+                 base-uri 'none'; form-action 'none';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>导航标注台 · 3e学习助手</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f6e56'/%3E%3Ctext x='16' y='23' font-size='19' font-family='sans-serif' fill='%23fff' text-anchor='middle'%3E%F0%9F%A7%AD%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="studio.css" />
+</head>
+<body>
+  <div class="ns-shell">
+
+    <!-- ==================== 顶栏 ==================== -->
+    <header class="ns-topbar">
+      <div class="ns-brand">
+        <span class="ns-brand-icon">🧭</span>
+        <span class="ns-brand-text">导航标注台</span>
+      </div>
+      <div class="ns-topbar-mid" id="ns-pack-title">未命名数据包</div>
+      <div class="ns-spacer"></div>
+      <!-- ★ 步骤条（2026-10-13）：用户原话"目前真的很反人类"。
+           根因是这一页**没有"我现在该干嘛"**：一进来就被要求配 Key，
+           配完看到左边一整列表单（而那是**最后一步**才填的东西）。
+           所以顶栏挂一条两段的进度，告诉他走到哪了。
+           ⚠️ 它在"更多"按钮**前面** —— 步骤是"当下最要紧的事"，
+              比任何工具都重要（重构时差点被和次要按钮一起收走）。 -->
+      <div class="ns-steps-bar" id="ns-steps-bar">
+        <span class="ns-step" id="ns-step-1"><b>1</b> 标楼</span>
+        <span class="ns-step" id="ns-step-2"><b>2</b> 发布</span>
+      </div>
+      <!-- ★ 撤销 / 重做（2026-10-13 晚）。
+           用户的原话："加入撤回重做这些功能，让它更像一个合格的编辑器。"
+           放在顶栏**最边上**：那是所有编辑器放它们的地方，而且它们得
+           "一眼看得出来能不能用"（disabled 状态由 nsRenderHistory 维护）。 -->
+      <button id="ns-btn-undo" class="ghost ns-hbtn" disabled title="还没有可撤销的（Ctrl+Z）">↶</button>
+      <button id="ns-btn-redo" class="ghost ns-hbtn" disabled title="重做（Ctrl+Shift+Z）">↷</button>
+      <!-- ★★ 「⋯ 更多」（2026-10-13 晚）。
+           顶栏原来**平铺 7 个按钮**，其中三个都是"导出"：
+           存草稿 / 导出文件 / 导出（含 Key）—— 用户得靠猜分清哪个是哪个。
+           现在只留**每天都会按的那一个**（一键发布），其余收进这里。
+           ⚠️ 按钮的 id 全部保留（别处都按 id 接的），只是换了位置。 -->
+      <div class="ns-more">
+        <button id="ns-btn-more" class="ghost" aria-haspopup="true" aria-expanded="false">⋯ 更多</button>
+        <div class="ns-more-menu hidden" id="ns-more-menu">
+          <!-- ⚠️ 每一项都**保留它原来的 id**（ns-btn-help / ns-btn-import /
+               ns-btn-savejson / ns-btn-export-nokey / ns-btn-export）——
+               JS 里那一大堆 `$('ns-btn-help').addEventListener(...)` 是直接
+               按 id 接的，没有 null 保护。少一个 id 的直接后果是
+               "TypeError: Cannot read properties of null"，而且是在页面
+               初始化时抛 —— 整个标注台直接白屏。
+               ⚠️ 实测踩过：收进菜单时只写了 data-act、把 id 丢了。 -->
+          <button id="ns-btn-help" data-act="help">怎么用</button>
+          <button id="ns-btn-import" data-act="import">打开文件…</button>
+          <button id="ns-btn-savejson" data-act="save">存一份草稿</button>
+          <hr />
+          <button id="ns-btn-export-nokey" data-act="export">导出文件（<b>不含</b> Key）</button>
+          <button id="ns-btn-export" data-act="exportkey">导出文件（含 Key）</button>
+        </div>
+      </div>
+      <!-- ★★★ 一键发布（2026-10-13）。用户原话：
+             "编辑好标注包的信息并一键发布"。
+           在这之前**只有下载文件**，没有上传 —— 用户拿到 .json 之后
+           还得自己找管理台手动传，等于没有"发布"这一步。 -->
+      <button id="ns-btn-publish" class="primary">一键发布</button>
+    </header>
+
+    <!-- ==================== 主体：左列表 / 中地图 / 右编辑 ==================== -->
+    <div class="ns-body">
+
+      <!-- ---------- 左：数据包信息 + 楼栋列表 ---------- -->
+      <aside class="ns-left">
+        <section class="ns-card ns-grow">
+          <div class="ns-card-head">
+            <h2 class="ns-card-title">楼栋 <span id="ns-count" class="ns-count">0</span></h2>
+            <!-- ★★★ 「待确认 N」常驻入口（2026-10-13 下午加）。
+                 用户的原话：**"没找到对应的控件或者说按钮。"**
+                 他刚做完二次识别，提示条让他"点黄叹号确认"，可界面上
+                 · 那个"黄叹号"当时只是列表里一个 11px 的小字（现在加了黄标）
+                 · 而"批量确认"这个名字**根本不存在** —— 真名叫「确认名字」，
+                   而且在批量条里，那条只在「批量」工具下才出现
+                 于是这句话等于让他去点一个要先切工具、要逐栋勾选、名字还不对的按钮。
+                 现在把入口摆在这里：**常驻、带计数、一次点击全认**。
+                 文字由 nsRenderConfirmAll() 写（要显示"还剩几个"）。 -->
+            <button id="ns-btn-confirmall" class="ns-confirm-all" hidden
+                    title="这些名字是「二次识别」自动填的 —— 扫一眼，对了就一次全认"></button>
+            <button id="ns-btn-newb" class="ghost small">＋ 新建</button>
+          </div>
+
+          <!-- ★★★ 「从 OSM 导入」放在**这里**（左边面板、常驻）。
+               ⚠️ 它原来在右边那个"楼栋编辑器"里，而编辑器**只有选中某一条时才显示** ——
+                  于是"一栋楼都没有"的时候那个按钮根本看不见，新用户永远导不进来。
+                  这是实跑的时候点不动才发现的（Playwright 报 "element is not visible"）。 -->
+          <button id="ns-btn-osm" class="ns-cta">
+            <span class="ns-cta-icon">⬇</span>
+            <span class="ns-cta-text">
+              <b>从 OSM 导入这一带的建筑</b>
+              <small>按当前地图范围拉 —— 现成的轮廓和名字，不用描</small>
+            </span>
+          </button>
+          <p class="ns-hint" id="ns-osm-hint">
+            把地图拖到你的校区、缩放到看得见楼，再点上面那个按钮。<br />
+            数据来自 <b>OpenStreetMap</b>（© OpenStreetMap contributors，ODbL 协议）。
+          </p>
+
+          <!-- ★★ 「整理」折起来（2026-10-13 晚）。
+               左栏原来是**三个大 CTA 平铺**：导入 / 补轮廓 / 清掉没名字的 ——
+               而后两个是"偶尔用一次"的动作，平铺只会把主路径挤到下面去。
+               ⚠️ 按钮的 id 全部保留（别处按 id 改它们的显隐和文字）。
+               ⚠️ 里面一个可用的都没有时，整块由 nsRenderTidy() 收起来。 -->
+          <details class="ns-tidy" id="ns-tidy">
+            <summary>整理这一片</summary>
+            <button id="ns-btn-fill" class="ns-cta" hidden>
+              <span class="ns-cta-icon">⬚</span>
+              <span class="ns-cta-text">
+                <b id="ns-fill-label">自动补上真实轮廓</b>
+                <small>去 OpenStreetMap 找这些楼本来的形状 —— 不用你描</small>
+              </span>
+            </button>
+            <button id="ns-btn-prune" class="ns-cta ghost" hidden>
+              <span class="ns-cta-icon">⌫</span>
+              <span class="ns-cta-text">
+                <b id="ns-prune-label">清掉没名字的</b>
+                <small>只留你标过名字的 —— 导出和手机上都只看得到它们</small>
+              </span>
+            </button>
+            <!-- ★★★ 一键清空（2026-10-13 晚，用户点名要的）。
+                 用户的原话："加入一键清空按钮，可以直接清掉所有已添加的点，
+                 然后重新来过。"
+
+                 ⚠️ 它是**全删**（连标定原点），和上面那条"清掉没名字的"是两回事：
+                    那条有筛选条件，这条没有 —— 是"我要重来"。
+                 ⚠️ 破坏性操作的三条规矩见 nsClearAll：写清删几栋、当场给撤销、
+                    并且走 nsSave 进撤销栈（Ctrl+Z 也能回来）。 -->
+            <button id="ns-btn-clear" class="ns-cta danger" hidden>
+              <span class="ns-cta-icon">␡</span>
+              <span class="ns-cta-text">
+                <b id="ns-clear-label">清空全部</b>
+                <small>删掉所有楼和原点，从头再来 —— 删完还能撤销</small>
+              </span>
+            </button>
+          </details>
+
+          <!-- ★★ 搜索框（2026-10-13 晚加）。
+               楼一多（实测一次导进 155 栋），在列表里找一栋就是滚半天 ——
+               而"改哪一栋"这件事在标注里是高频动作。 -->
+          <input id="ns-list-q" class="ns-list-q" type="search"
+                 placeholder="搜楼名 / 别名 / 房号" spellcheck="false" />
+
+          <div id="ns-list" class="ns-list"></div>
+          <div id="ns-list-empty" class="ns-empty">
+            还没有楼栋。<br />
+            点上面的「从 OSM 导入这一带的建筑」—— 大多数学校那一片都已经有人标好了。
+          </div>
+        </section>
+
+        <!-- ★★ 数据包信息**移到最下面并折叠**（2026-10-13）。
+             用户原话"目前真的很反人类"。最刺眼的一条就是这里的顺序：
+             一进来最上面是一个空表单（包标识/名称/说明），而那是
+             **最后一步**才填的东西；真正的第一步（导入楼栋）被压在下面。
+             现在它默认收起，标题直接说清楚"什么时候填"。 -->
+        <details class="ns-card ns-pack-fold" id="ns-pack-fold">
+          <summary class="ns-card-title">
+            数据包信息 <span class="ns-hint inline">—— 发布前填这几格</span>
+          </summary>
+          <div class="ns-fold-body">
+            <label class="ns-field">
+              <span>包标识（授权码）</span>
+              <input id="ns-pack-id" type="text" placeholder="如 gdo-huguang" spellcheck="false" />
+              <small id="ns-pack-id-hint" class="ns-hint">小写字母 / 数字 / 连字符。用户凭它从云端拉这个包。</small>
+            </label>
+            <label class="ns-field">
+              <span>名称</span>
+              <input id="ns-pack-name" type="text" placeholder="如 广东海洋大学湖光校区" />
+            </label>
+            <label class="ns-field">
+              <span>说明</span>
+              <textarea id="ns-pack-note" rows="2" placeholder="一段给导入的人看的说明"></textarea>
+            </label>
+            <div class="ns-row2">
+              <label class="ns-field">
+                <span>版本</span>
+                <input id="ns-pack-version" type="text" placeholder="1.0.0" value="1.0.0" />
+              </label>
+              <label class="ns-field">
+                <span>标定原点</span>
+                <input id="ns-pack-origin" type="text" placeholder="点地图拾取" readonly />
+              </label>
+            </div>
+            <p class="ns-hint">
+              标定原点 = 这份数据"属于哪一片"。填了之后，导入的人会看到
+              「这是『××』的包，确定导入吗」，也用来体检坐标有没有标飞。
+            </p>
+          </div>
+        </details>
+
+      </aside>
+
+      <!-- ---------- 中：地图 ---------- -->
+      <main class="ns-map-wrap">
+        <div id="ns-map"></div>
+
+        <!-- 没配 JS API Key 时盖在上面的一层 -->
+        <div id="ns-key-gate" class="ns-gate">
+          <div class="ns-gate-box">
+            <div class="ns-gate-icon">🗺</div>
+            <h3>先配一个「地图 JS API」Key</h3>
+            <!-- ⚠️ 这段文案 2026-10-13 改过。原文写着
+                   "和插件里那个 WebServiceAPI 的 Key 不是同一个，
+                    腾讯要求分两次申请，两个 Key 不能互相顶用"
+                 —— 那是**错的**。用户明确纠正过：
+                 "那个 API key 是通用的，默认就授权 JavaScript"。
+                 按错的说明去做，用户会去申请第二个 Key、发现"没这个必要"，
+                 然后不知道该信哪一句。 -->
+            <p>
+              把腾讯位置服务的 Key 粘进来就行 ——
+              <b>和插件里用的是同一个 Key</b>，不用另外申请。
+            </p>
+            <p>
+              唯一的条件：这个 Key 在腾讯控制台里<b>勾了「JavaScript API GL」</b>。
+              没勾的话地图会建不起来（控制台里补勾一下，一分钟的事）。
+            </p>
+            <label class="ns-field">
+              <span>地图 JS API Key</span>
+              <input id="ns-mapkey" type="text" placeholder="粘贴 JS API 的 Key" spellcheck="false" />
+            </label>
+            <button id="ns-btn-mapkey" class="primary">开始标定</button>
+            <p class="ns-gate-tip">
+              申请（约 1 分钟）：<a
+                href="https://lbs.qq.com/dev/console/key/manage"
+                target="_blank" rel="noopener noreferrer">打开 lbs.qq.com 控制台 → 应用管理 → 添加 Key</a>，
+              勾选「<b>JavaScript API GL</b>」，把生成的 Key 粘到上面。<br />
+              ⚠️ 它只存在你这台电脑的浏览器里，不会上传、不会进仓库。
+            </p>
+
+            <!-- ★ 2026-10-12 加的退路：没有 JS Key 也不该被卡死 -->
+            <div class="ns-gate-alt">
+              <button id="ns-btn-nomap" class="ghost small">先不用地图 —— 我直接填坐标</button>
+              <span class="ns-hint">
+                在腾讯地图 App 里<b>长按那栋楼</b> → 复制坐标 → 粘进右边的「坐标」格。
+                标注照样能做，只是看不见底图。
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ★★★ 地图标注层（2026-10-13 深夜）。
+             用户要的"文字说明 / 气泡 / 门牌 / 贴纸 / 入口 / 楼梯"全画在这一层里。
+
+             ⚠️ 它是**地图内容**，不是控件 —— 但同样要在三处登记
+                （nsClickOnOverlay / nsShieldFromMap / nsSetMapChrome），
+                否则点一个门牌会顺手在这一点**新建一栋楼**。
+             ⚠️ 层本身 `pointer-events: none`、每个标注 `auto` ——
+                这样标注之间的空白照样能点地图（不然一层透明的 DOM 就把地图锁住了）。 -->
+        <div id="ns-mark-layer" class="ns-mark-layer"></div>
+
+        <!-- 地图上的操作提示条。
+             ⚠️ 这段字 2026-10-13 改过。原文写的是
+                "单击地图 = 取这个点（填进正在编辑的那条） · 双击 = 在这个点新建一栋"，
+             而**当时实际行为不是那样**：那时候 `ns.pickNew` 默认是开着的，单击就是"新建一栋"。
+             ★ 2026-10-13 第二轮：它已换成工具表，**默认是「选择」**，单击不再误建。
+             说明和界面不一致 = 用户照着做、做不成、以为自己错了。
+             现在这里写**动态**的那一种（见 nsRenderMapTip）。 -->
+        <div id="ns-map-tip" class="ns-map-tip"></div>
+
+        <!-- ★★★ 描轮廓的浮动操作条（2026-10-13 晚）。
+             用户的原话："把这个建模功能再优化优化，现在用起来不是很顺手。"
+
+             描轮廓原来是这么走的：
+               右栏点「开始描轮廓」→ 回地图沿外墙点一圈 → 再回右栏找「结束描轮廓」
+             而描的时候眼睛和手**都在地图上** —— 那个来回本身就是"不顺手"。
+             更糟的是过程中唯一的反馈是页面最底下那行状态（`轮廓 5 个点`），
+             描的人根本不会往那儿看。
+
+             所以把它挪到地图上、手边上：**几个点、撤销、完成**，一条齐活。
+
+             ⚠️ 它必须在**三处**都登记，少一处就出鬼：
+                · nsClickOnOverlay  —— 不登记的话点它会在地图上多描一个顶点
+                · nsShieldFromMap   —— 不登记的话事件会漏给地图
+                · nsSetMapChrome    —— 不登记的话走「先不用地图」时它不跟着收 -->
+        <div id="ns-shape-bar" class="ns-shape-bar hidden">
+          <span id="ns-shape-bar-text" class="ns-shape-bar-text"></span>
+          <button id="ns-shape-undo" class="ghost small">↶ 撤销一点</button>
+          <button id="ns-shape-done" class="primary small">✓ 完成</button>
+        </div>
+
+        <!-- ★★★ 工具条（2026-10-13 第二轮加）。
+             用户的原话："要加入选择工具、标点工具以及批量工具之类的，
+             允许我进行更精细的操作，而不是我点一下就新建一个点。"
+             放**地图左上角**：它是"点地图会发生什么"的开关，离地图越近越好。
+             按钮由 nsRenderToolbar() 画（工具表在 nav-studio.js 里，一处定义）。 -->
+        <div id="ns-toolbar" class="ns-toolbar"></div>
+
+        <!-- ★ 批量操作条（只在「批量」工具下出现）。
+             用户说"批量工具之类的" —— 它是"一次改一批"的落点：
+             改类别、二次识别、补轮廓、确认名字、删除。 -->
+        <div id="ns-batch-bar" class="ns-batch-bar hidden">
+          <span id="ns-batch-n" class="ns-batch-n">还没选</span>
+          <button data-batch="all" class="ghost">全选</button>
+          <button data-batch="none" class="ghost">清空</button>
+          <span class="ns-batch-sep"></span>
+          <select id="ns-batch-type" title="改成这个类别"></select>
+          <button data-batch="type">改类别</button>
+          <button data-batch="poi" class="ns-poi-btn">二次识别</button>
+          <button data-batch="shape" class="ghost">补轮廓</button>
+          <button data-batch="confirm" class="ghost">确认名字</button>
+          <button data-batch="delete" class="ghost danger">删除</button>
+        </div>
+
+        <!-- 地图右上角的浮动按钮（2026-10-13 加） -->
+        <div id="ns-map-tools" class="ns-map-tools">
+          <button id="ns-btn-3d" title="2D / 3D 切换">2D 视图</button>
+          <button id="ns-btn-fit" title="把所有楼装进视野">看全部</button>
+        </div>
+
+        <!-- 选了「先不用地图」之后，地图区显示这个。
+             ⚠️ 没有它的话，那一块就是**一片没有任何解释的空白** ——
+                正是用户这一轮报的现象。 -->
+        <div id="ns-map-fallback" class="ns-gate hidden">
+          <div class="ns-gate-box">
+            <div class="ns-gate-icon">📋</div>
+            <h3>正在用「填坐标」模式</h3>
+            <p>
+              在腾讯地图 App 里<b>长按那栋楼</b> → 点弹出的地点卡片 → <b>复制坐标</b>，
+              然后粘进右边的「坐标」格。<br />
+              填完一栋，点左边的「＋ 新建」接着填下一栋。
+            </p>
+            <p class="ns-gate-tip">
+              想要底图的话，去 <a
+                href="https://lbs.qq.com/dev/console/key/manage"
+                target="_blank" rel="noopener noreferrer">lbs.qq.com</a>
+              申请一个「<b>JavaScript API GL</b>」Key，再刷新这一页。
+            </p>
+            <button id="ns-btn-retry-map" class="ghost small">重新试一次地图</button>
+          </div>
+        </div>
+      </main>
+
+      <!-- ---------- 右：编辑当前楼栋 ---------- -->
+      <aside class="ns-right" id="ns-editor">
+        <div class="ns-editor-empty" id="ns-editor-empty">
+          <div class="ns-editor-empty-icon">🏢</div>
+          <!-- ⚠️ 文案 2026-10-13 晚改。原文写的是"或在地图上双击一个点" ——
+               而双击现在的意思是"飞过去放大看它"（换过好几轮），照着做只会
+               多建出一栋空楼。说明和界面不一致 = 用户照着做、做不成、以为自己错了。 -->
+          <p>还没选中哪一栋<br />在左边列表里点一条，或在图上点一个标记<br />
+            <span class="ns-hint">（想在地图上写字 / 贴门牌 / 标入口，用左上角的「标注」工具）</span>
+          </p>
+        </div>
+
+        <!-- ★★★ 标注的编辑面板（2026-10-13 深夜）。
+             和楼栋表单**互斥**：选中一条标注时显示这个、楼栋那个收起来。
+
+             ⚠️ 六种类型共用这一张表单 —— 只有「文字内容」和「图标」会随类型
+                显示/隐藏，其余（位置 / 宽 / 高 / 角度 / 颜色）六种都有。
+                这就是"一张表管六种"的意思：加第七种只改一行类型表。 -->
+        <div class="ns-editor-body hidden" id="ns-mark-body">
+          <div class="ns-card-head">
+            <h2 class="ns-card-title" id="ns-mark-title">编辑标注</h2>
+            <button id="ns-mark-unsel" class="ghost small ns-unsel">取消选择</button>
+            <button id="ns-mark-del" class="ghost small danger">删除</button>
+          </div>
+
+          <div class="ns-field">
+            <span>类型</span>
+            <div id="ns-mark-kinds" class="ns-mark-kinds"></div>
+          </div>
+
+          <label class="ns-field" id="ns-mark-text-field">
+            <span>文字内容</span>
+            <input id="ns-mark-text" type="text" placeholder="如：东门 / A3 / 上二楼" />
+            <small class="ns-hint" id="ns-mark-text-hint">不写也行 —— 先放个位置，回头再补。</small>
+          </label>
+
+          <label class="ns-field" id="ns-mark-icon-field">
+            <span>图标</span>
+            <input id="ns-mark-icon" type="text" placeholder="一个符号，如 ⭐ 🚻 🅿" maxlength="4" />
+            <small class="ns-hint">贴纸用这个。手机上是同样的符号。</small>
+          </label>
+
+          <div class="ns-row2">
+            <label class="ns-field">
+              <span>宽（米）</span>
+              <input id="ns-mark-w" type="number" min="0" step="0.5" placeholder="0 = 自动" />
+            </label>
+            <label class="ns-field">
+              <span>高（米）</span>
+              <input id="ns-mark-h" type="number" min="0" step="0.5" placeholder="0 = 自动" />
+            </label>
+          </div>
+
+          <label class="ns-field">
+            <span>角度</span>
+            <input id="ns-mark-rot" type="number" step="5" placeholder="0" />
+            <small class="ns-hint">牌子 / 贴纸可以转个角度贴着墙走。</small>
+          </label>
+
+          <label class="ns-field">
+            <span>颜色</span>
+            <input id="ns-mark-color" type="color" />
+          </label>
+
+          <p class="ns-hint" id="ns-mark-tip">
+            提示：在地图上**按住这个标注**可以拖到别处。
+          </p>
+        </div>
+
+        <div class="ns-editor-body hidden" id="ns-editor-body">
+          <div class="ns-card-head">
+            <h2 class="ns-card-title" id="ns-ed-title">编辑楼栋</h2>
+            <!-- ★ 「取消选择」（2026-10-13 晚）。
+                 用户的原话："我没办法取消选择一个建筑，这也是一个非常大的问题。"
+                 三个出口里这是最显眼的一个（另外两个是 Esc 和点地图空白处）。 -->
+            <button id="ns-btn-unsel" class="ghost small ns-unsel"
+                    title="取消选中 —— 也可以按 Esc，或在图上点一下空白处">取消选择</button>
+            <button id="ns-btn-delb" class="ghost small danger">删除</button>
+          </div>
+
+          <label class="ns-field">
+            <span>楼名 <em class="req">必填</em></span>
+            <input id="ns-b-name" type="text" placeholder="如 明德楼B1" />
+          </label>
+
+          <label class="ns-field">
+            <span>坐标</span>
+            <input id="ns-b-coord" type="text" placeholder="24.8741,118.6742" spellcheck="false" />
+            <small id="ns-b-coord-hint" class="ns-hint">纬度在前。在地图上单击就自动填进来。</small>
+          </label>
+
+          <label class="ns-field">
+            <span>别名</span>
+            <input id="ns-b-alias" type="text" placeholder="明德B1，B1" />
+            <small class="ns-hint">
+              日程里可能怎么写它。逗号分隔 —— 填了之后「明德B1」「B1」都能认出来。
+            </small>
+          </label>
+
+          <div class="ns-row2">
+            <label class="ns-field">
+              <span>分类</span>
+              <select id="ns-b-type"></select>
+              <small id="ns-b-type-hint" class="ns-hint">用于手机端按类型筛楼。</small>
+            </label>
+            <label class="ns-field">
+              <span>校区</span>
+              <input id="ns-b-campus" type="text" placeholder="主校区" />
+            </label>
+          </div>
+
+          <label class="ns-field">
+            <span>备注</span>
+            <input id="ns-b-note" type="text" placeholder="东门进去第二栋" />
+          </label>
+
+          <p class="ns-hint" id="ns-b-far"></p>
+
+          <!-- ---------- 3D 建模（2026-10-13 重做） ----------
+               ★ 主路径是**从 OSM 导入** —— 不用描、不用建，
+                 现成的轮廓 + 现成的名字，用户只需要确认和分类。
+               数据来源：OpenStreetMap（ODbL，需署名，见下方）。 -->
+          <div class="ns-card ns-shape-card">
+            <div class="ns-card-head">
+              <h2 class="ns-card-title">3D 建模</h2>
+              <span id="ns-shape-count" class="ns-badge">0 点</span>
+            </div>
+
+            <!-- ★ 主路径（从 OSM 导入）现在放在**左边面板**常驻 ——
+                 这一份是"在编辑器里也能再导一次"的补充入口，
+                 所以用 class 而不是 id（同一个 id 不能出现两次）。 -->
+            <button class="ns-cta ns-osm-again">
+              <span class="ns-cta-icon">⬇</span>
+              <span class="ns-cta-text">
+                <b>再导一次这一带的建筑</b>
+                <small>校园新盖了楼？把地图拖过去再导 —— 已导过的不会重复</small>
+              </span>
+            </button>
+
+            <!-- ★★★ 二次识别地名（2026-10-13）。
+                 用户的原话："加入一个自动识别地名的功能……不是从那个 O 什么的
+                 那个公开数据里面提取，而是通过那个模型覆盖的地图的地名
+                 进行自动识别。当然你可以要求用户自己再看一遍，确认没错了再用。
+                 当然默认还是按自动识别的结果，只不过你要标出来，
+                 例如说原本是绿色的勾，然后标记为黄色的感叹号，
+                 用户再点击一下，又会变成绿色的勾。"
+
+                 ⚠️ 走的是**我们服务端的代理**（`/api/nav/poi`）——
+                    腾讯那个地点搜索接口没有 CORS 头，浏览器直连会被拒（实测）。
+                 ⚠️ 用 class 不用 id：左边面板和批量条里各有一个。 -->
+            <button class="ns-cta ns-poi-btn">
+              <span class="ns-cta-icon">🔎</span>
+              <span class="ns-cta-text">
+                <b>二次识别地名</b>
+                <small>用腾讯地图自己的地名填名字（不碰 OSM）—— 结果标成黄叹号，你确认一下变绿勾</small>
+              </span>
+            </button>
+
+            <!-- 补充：OSM 里没有的楼，点一下补上 -->
+            <button id="ns-btn-picknew" class="ns-cta ghost">
+              <span class="ns-cta-icon">＋</span>
+              <span class="ns-cta-text">
+                <b>点选补一栋</b>
+                <small>OSM 里没有的楼 —— 在地图上点一下补上</small>
+              </span>
+            </button>
+
+            <!-- 类型（用颜色选，一眼知道手机端会是什么色） -->
+            <div class="ns-field">
+              <span>类别（手机端按这个上色）</span>
+              <div id="ns-type-legend" class="ns-legend"></div>
+            </div>
+
+            <!-- ★★★ 形状微调（2026-10-13 深夜重做）。
+                 用户的原话：
+
+                 > "还有那个模型微调是什么鬼呀？怎么点它都是模型加大，
+                 >  然后也不能进行调整。那个大小宽的最好是能做一个那个单独点
+                 >  让我们进行调整，或者说**做一个滑条**让我们去调整。
+                 >  同样的还要支持微调，就是加减按键。"
+
+                 ⚠️ 原来那六个按钮的根因（"怎么点都是加大"）：
+                    它们从**当前形状的外接框**反推宽/深，而矩形一旋转外接框就变大
+                    （w·cos15° + d·sin15° > w）→ 下次读到的是**虚高的**尺寸 →
+                    再加 3 米 → 每点一次都比上次大一圈。
+                 现在改成：滑条给**目标尺寸**，一切以"按下去那一刻的形状"为基准重算。
+
+                 ⚠️ `data-nudge` 这个属性**保留**（绑定用的是它的委托），只是换了位置。 -->
+            <div class="ns-field">
+              <span>形状微调</span>
+              <div class="ns-dims">
+                <div class="ns-dim">
+                  <b>宽</b>
+                  <button data-nudge="w-" class="ghost small" title="窄 0.5 米">−</button>
+                  <input type="range" id="ns-dim-w" min="1" max="200" step="0.5" value="24" />
+                  <button data-nudge="w+" class="ghost small" title="宽 0.5 米">＋</button>
+                  <em id="ns-dim-w-val">—</em>
+                </div>
+                <div class="ns-dim">
+                  <b>深</b>
+                  <button data-nudge="d-" class="ghost small" title="浅 0.5 米">−</button>
+                  <input type="range" id="ns-dim-d" min="1" max="200" step="0.5" value="14" />
+                  <button data-nudge="d+" class="ghost small" title="深 0.5 米">＋</button>
+                  <em id="ns-dim-d-val">—</em>
+                </div>
+                <div class="ns-dim">
+                  <b>角度</b>
+                  <button data-nudge="r-" class="ghost small" title="逆时针 5°">−</button>
+                  <input type="range" id="ns-dim-r" min="-180" max="180" step="1" value="0" />
+                  <button data-nudge="r+" class="ghost small" title="顺时针 5°">＋</button>
+                  <em id="ns-dim-r-val">—</em>
+                </div>
+              </div>
+              <small class="ns-hint">
+                拖滑条可以连着调；两边的 − ＋ 是微调（宽深每次 0.5 米，角度每次 5°）。
+              </small>
+            </div>
+
+            <!-- 精细：自己描一圈（不规则形状才需要） -->
+            <details class="ns-details">
+              <summary>OSM 里也没有？自己描一圈</summary>
+              <p class="ns-hint" id="ns-shape-hint">
+                在地图上沿着这栋楼的外墙点一圈（至少 3 个点）。
+              </p>
+              <div class="ns-nudge">
+                <button id="ns-btn-shape-draw" class="ghost">开始描轮廓</button>
+                <button id="ns-btn-shape-undo" class="ghost">撤销一个点</button>
+              </div>
+              <div class="ns-nudge" style="margin-top:6px">
+                <button id="ns-btn-shape-clear" class="ghost danger">清空轮廓</button>
+                <button id="ns-btn-shape-rect" class="ghost">用矩形兜底</button>
+              </div>
+            </details>
+          </div>
+
+          <!-- ---------- 分层：楼层 + 房间 ---------- -->
+          <div class="ns-card ns-floor-card">
+            <div class="ns-card-head">
+              <h2 class="ns-card-title">楼层与房间</h2>
+            </div>
+
+            <div class="ns-floor-bar" id="ns-floor-bar"></div>
+
+            <div class="ns-floor-tools hidden" id="ns-floor-tools">
+              <input id="ns-floor-name" type="text" class="ns-floor-name" placeholder="1F" />
+              <span class="ns-hint inline">层名可以随便写（1F / 一楼 / B1）</span>
+            </div>
+
+            <div class="ns-floor-grid">
+              <div class="ns-room-list" id="ns-room-list"></div>
+              <div class="ns-floor-canvas hidden" id="ns-floor-canvas"></div>
+            </div>
+
+            <p class="ns-hint" id="ns-floor-hint"></p>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- ==================== 底栏状态 ==================== -->
+    <footer class="ns-status" id="ns-status">准备就绪</footer>
+  </div>
+
+  <!-- ==================== 一键发布 ====================
+       ★★★ 2026-10-13 加。用户的路径里明确有这一步：
+         "编辑好标注包的信息并一键发布"。
+       在这之前**只有下载文件** —— 用户拿到 .json 之后还得自己找管理台手动传，
+       那就不叫"发布"。
+
+       ⚠️ 交互上的三个决定：
+         ① **要管理员登录**（用户名+密码换 token）。上传接口是 admin 接口，
+            没有第二条路；而且 token 存在本机浏览器里，下次不用再登。
+         ② **重名要显式确认**。覆盖一个 packId = 所有已拿到这个码的人
+            下次导入都会跟着换 —— 必须让人看见"换成什么"，不能默默盖掉。
+         ③ **成功之后把授权码放大 + 一键复制**。那是用户唯一要转发出去的东西。 -->
+  <div class="ns-modal hidden" id="ns-publish">
+    <div class="ns-modal-box ns-publish-box">
+      <h3>发布标注包</h3>
+
+      <!-- 发布前的体检结果：有占位矩形就提醒（那正是用户报过的问题） -->
+      <div id="ns-pub-check" class="ns-pub-check"></div>
+
+      <div class="ns-pub-grid">
+        <div class="ns-pub-kv"><span>授权码</span><b id="ns-pub-id">—</b></div>
+        <div class="ns-pub-kv"><span>名称</span><b id="ns-pub-name">—</b></div>
+        <div class="ns-pub-kv"><span>楼栋</span><b id="ns-pub-count">—</b></div>
+      </div>
+
+      <!-- 登录（拿到 token 之后就藏起来） -->
+      <div id="ns-pub-login">
+        <p class="ns-hint">
+          发布要管理员身份。登录一次就行，之后这台电脑会记住。<br />
+          没有管理员账号？那就是找学校这边的管理员来发 —— 或者先点「导出文件」
+          把 <code>.json</code> 发给他。
+        </p>
+        <div class="ns-row2">
+          <label class="ns-field"><span>用户名</span><input id="ns-pub-user" type="text" autocomplete="username" /></label>
+          <label class="ns-field"><span>密码</span><input id="ns-pub-pass" type="password" autocomplete="current-password" /></label>
+        </div>
+      </div>
+      <p id="ns-pub-msg" class="ns-pub-msg"></p>
+
+      <div class="ns-pub-actions">
+        <button id="ns-btn-pub-cancel" class="ghost">取消</button>
+        <button id="ns-btn-pub-go" class="primary">发布</button>
+      </div>
+
+      <!-- 成功之后的结果面板（把授权码给他去转发） -->
+      <div id="ns-pub-done" class="ns-pub-done hidden">
+        <p>发布成功 —— 把这个<b>授权码</b>发给要用的人：</p>
+        <div class="ns-pub-code">
+          <code id="ns-pub-code">—</code>
+          <button id="ns-btn-pub-copy" class="ghost small">复制</button>
+        </div>
+        <p class="ns-hint" id="ns-pub-how"></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ★★★ 「识别结果 / 确认名字」面板（2026-10-13 晚加）。
+       用户的原话：
+         "识别效果特别差，也不知道在识别什么。还有就是确认的话也没有个
+          统一的界面吧。整个操作非常的混乱。"
+       这一个面板同时承担两件事，**没有第二个确认界面**：
+         · 二次识别之后 —— 把每栋的候选摆出来让他挑（机器排序、人来拍板）
+         · 点左边那个「! 待确认 N」—— 把待确认的列出来，逐条确认或跳过 -->
+  <div class="ns-modal hidden" id="ns-poi-review">
+    <div class="ns-modal-box ns-poi-box">
+      <h3 id="ns-poi-title">识别结果</h3>
+      <p class="ns-hint" id="ns-poi-sub"></p>
+      <div class="ns-poi-list" id="ns-poi-list"></div>
+      <div class="ns-poi-acts">
+        <button id="ns-poi-first" class="primary">全部用第一个</button>
+        <button id="ns-poi-apply" class="ghost">就按这些</button>
+        <button id="ns-poi-cancel" class="ghost">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 帮助浮层 -->
+  <div class="ns-modal hidden" id="ns-help">
+    <div class="ns-modal-box">
+      <h3>三分钟上手</h3>
+      <!-- ⚠️ 这一份原来是按**旧行为**写的（"双击那栋楼新建一条"、
+           "自己去管理台传文件"），而实际行为早就变了 ——
+           说明和界面不一致是"反人类"里最伤的一种：用户照着做，做不成，
+           然后以为自己操作错了。2026-10-13 按**现在真实的行为**重写。 -->
+      <ol class="ns-steps">
+        <li>
+          <b>配地图 Key</b>（只做一次）：把腾讯位置服务的 Key 粘进去就行。
+          同一个 Key 勾了 <b>JavaScript API GL</b> 就能用；没勾的话去
+          lbs.qq.com 控制台补一下。
+        </li>
+        <li>
+          <b>把地图拖到你的学校</b>（缩放调到看得见楼）。
+          下次打开会**回到你上次看的地方**，不用每次重拉。
+        </li>
+        <li>
+          <b>点左上那个大按钮「从 OSM 导入这一带的建筑」</b> ——
+          <b>最省事的做法</b>。一次能把整片校区的真实轮廓和名字拉下来
+          （数据来自 OpenStreetMap，ODbL 协议，可免费使用，需署名）。
+        </li>
+        <li>
+          <b>OSM 上没有的楼，点地图补</b>：在地图上<b>单击</b>那栋楼，
+          它会自动建一条，并<b>自动去找那栋楼的真实轮廓</b> ——
+          你不用描。名字如果腾讯地图上有也会自动填上。
+        </li>
+        <li>
+          <b>改名字 / 选分类</b>：在右边填楼名（如「明德楼B1」）、
+          填别名（如「明德B1，B1」，用逗号分隔），再用色块选个类别
+          （教学楼 / 宿舍 / 食堂…）。手机上按类别筛选就靠它。
+        </li>
+        <li>
+          <b>轮廓不对？</b>左边有「自动补上真实轮廓」——
+          把那些还是<b>默认矩形</b>的楼一次换成真形状。<br />
+          真要自己描，用右边「开始描轮廓」，然后沿着外墙点一圈。
+        </li>
+        <li>
+          <b>标每层房间</b>（可选）：右边「楼层与房间」→「＋ 加一层」，
+          在方格图上拖一个框就是一间房。方格代表这栋楼，
+          <b>正中央是楼的中心</b>。只标「大概在哪」就够用。
+        </li>
+        <li>
+          <b>填包信息</b>：左边最下面「数据包信息」点开 ——
+          包标识（<b>它同时是用户的授权码</b>）、名称、说明。
+        </li>
+        <li>
+          <b>一键发布</b>：点右上角「一键发布」→ 用管理员账号登一次 →
+          发出去，界面上会给你那串<b>授权码</b>，直接转发给要用的人。<br />
+          <span class="ns-hint inline">
+            只是想把文件给别人？用「导出文件」。<br />
+            ⚠️ 「导出（含 Key）」= 这份壳里带着腾讯 Key 的<b>明文</b>，
+            只在确认只发给该发的人时用。
+          </span>
+        </li>
+      </ol>
+      <p class="ns-hint">
+        分类和分层是后加的字段，格式版本因此从 1 升到了 2。
+        老包（版本 1）照样能导进来，只是没有分类和房间。
+      </p>
+      <button id="ns-btn-help-close" class="primary">知道了</button>
+    </div>
+  </div>
+
+  <div id="ns-toast" class="ns-toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="studio.js"></script>
+</body>
+</html>

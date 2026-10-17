@@ -1,0 +1,19 @@
+{
+  "note": "烘焙好的校区清单。改这个文件的是 scripts/osm-bake.mjs，不要手改。",
+  "campuses": [
+    {
+      "slug": "gdo-huguang",
+      "name": "广东海洋大学湖光校区",
+      "bbox": [
+        21.1373,
+        110.2884,
+        21.1613,
+        110.3144
+      ],
+      "buildings": 155,
+      "named": 20,
+      "file": "gdo-huguang.json",
+      "attribution": "© OpenStreetMap contributors"
+    }
+  ]
+}

@@ -1,0 +1,1603 @@
+/* ==========================================================================
+   导航标注台 · 样式（2026-10-12）
+   ==========================================================================
+
+   色板**沿用 style.css 那一套变量**（--surface / --primary / --danger …），
+   所以本页跟随系统深浅色、也不会和别的页面观感打架。
+   但它**不 import style.css** —— 那一份是给"手机优先的应用壳"写的
+   （`.app-shell` / 底部标签栏 / 安全区），套在一个三栏桌面工具上会拧着来。
+
+   ⚠️ 变量在这里**重复声明了一份**。这是刻意的取舍：
+      import 一个为完全不同的布局写的样式表、再到处 `!important` 压回去，
+      比多写这 20 行更容易出错，而且改一处会伤到另一个页面。
+      代价是"调色板改了要改两处" —— 值的稳定性远高于布局，
+      这个代价可以接受。
+   ========================================================================== */
+
+:root {
+  --bg: #fafaf8;
+  --surface: #ffffff;
+  --surface-2: #f4f4f1;
+  --text: #1f2023;
+  --muted: #6b6c70;
+  --border: #e2e2de;
+  --primary: #185fa5;
+  --primary-fg: #ffffff;
+  --primary-soft: #e6f1fb;
+  --teal: #0f6e56;
+  --danger: #a32d2d;
+  --danger-soft: #fcebeb;
+  --radius: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16171a;
+    --surface: #1e1f23;
+    --surface-2: #26272c;
+    --text: #ececee;
+    --muted: #a0a1a6;
+    --border: #33343a;
+    --primary: #85b7eb;
+    --primary-fg: #042c53;
+    --primary-soft: #0c447c;
+    --teal: #5dcaa5;
+    --danger: #f09595;
+    --danger-soft: #501313;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;              /* 桌面工具：整体不滚，只有各栏内部滚 */
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+}
+
+.hidden { display: none !important; }
+
+/* ---------------------------------------------------------------- 骨架 */
+
+.ns-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.ns-topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.ns-brand { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.ns-brand-icon { font-size: 16px; }
+.ns-topbar-mid {
+  color: var(--muted);
+  font-size: 12px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ns-spacer { flex: 1; }
+
+.ns-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;                 /* ★ 没有它，子项的 overflow 不生效 */
+}
+
+.ns-left {
+  flex: none;
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.ns-map-wrap {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+  background: var(--surface-2);
+  /* ★★★ 这一行是给腾讯地图擦屁股的（2026-10-13）。
+     
+     ## 不加它会怎样
+     
+     腾讯 GL 会往 `#ns-map` 里塞一个 **`z-index: 1000`** 的覆盖层。
+     而 `.ns-map-wrap` 原来是 `position: relative` + `z-index: auto` ——
+     **auto 不建立层叠上下文**，于是地图那个 1000 会跑到**根层级**去，
+     和页面里任何 `z-index < 1000` 的元素比大小。
+     
+     结果：`.ns-modal`（弹层，z-index 100）和 `.ns-toast`（提示条，200）
+     **都被地图盖住** —— 看得见，但**真实鼠标点不到**。
+     
+     实跑发现（Playwright 的命中检测和真实鼠标一致）：
+     「一键发布」对话框弹出来了、按钮也在，点下去却被地图接走。
+     
+     ⚠️ `z-index: 0` + `position: relative` = **建立层叠上下文**，
+        地图内部那一堆 z-index 就再也跑不出来。这是治本的那一下。 */
+  z-index: 0;
+  /* 兜底：老浏览器上 isolation 更可靠地切断层叠 */
+  isolation: isolate;
+}
+
+#ns-map { position: absolute; inset: 0; }
+
+.ns-right {
+  flex: none;
+  width: 320px;
+  padding: 8px;
+  overflow-y: auto;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.ns-status {
+  flex: none;
+  padding: 5px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
+/* ---------------------------------------------------------------- 卡片 */
+
+.ns-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+.ns-grow { flex: 1; min-height: 180px; display: flex; flex-direction: column; }
+
+.ns-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.ns-card-title { margin: 0; font-size: 13px; font-weight: 600; }
+.ns-count {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  margin-left: 2px;
+  border-radius: 9px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 11px;
+  text-align: center;
+}
+
+/* ---------------------------------------------------------------- 表单 */
+
+.ns-field { display: block; margin-bottom: 8px; }
+.ns-field > span {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+.ns-field .req { color: var(--danger); font-style: normal; }
+
+.ns-field input,
+.ns-field textarea {
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+.ns-field input:focus,
+.ns-field textarea:focus { border-color: var(--primary); }
+.ns-field textarea { resize: vertical; }
+
+/* ★ select 要和 input 长得一样 —— 否则同一个表单里两种控件观感打架 */
+.ns-field select {
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  cursor: pointer;
+}
+.ns-field select:focus { border-color: var(--primary); }
+
+.ns-field input.bad { border-color: var(--danger); background: var(--danger-soft); }
+
+.ns-hint { display: block; margin: 3px 0 0; font-size: 11px; color: var(--muted); }
+.ns-hint.warn { color: var(--danger); }
+.ns-hint.inline { display: inline; margin: 0; }
+
+.ns-row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+/* ---------------------------------------------------------------- 楼层/房间 */
+
+.ns-floor-card { margin-top: 10px; }
+
+.ns-floor-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+/**
+ * 楼层切换标签。
+ *
+ * ⚠️ 用 `button.small` 的底子 + `.on` 表示选中 —— 不新造一套
+ *    "标签"样式，是因为这个界面已经有 4 种按钮，再加一种就分不清了。
+ */
+.ns-floor-tab.on {
+  background: var(--primary);
+  color: var(--primary-fg);
+  border-color: var(--primary);
+}
+
+.ns-floor-tools { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.ns-floor-name {
+  width: 92px;
+  padding: 4px 7px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+.ns-floor-name:focus { border-color: var(--primary); }
+
+.ns-floor-grid {
+  display: grid;
+  grid-template-columns: 106px 1fr;
+  gap: 6px;
+  align-items: start;
+}
+
+.ns-room-list {
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.ns-room-row { display: flex; align-items: center; gap: 2px; }
+.ns-room-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 5px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  outline: none;
+}
+.ns-room-row input:focus { border-color: var(--primary); }
+.ns-room-row select {
+  flex: none;
+  width: 62px;
+  padding: 3px 2px;
+  font: inherit;
+  font-size: 10px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  outline: none;
+  cursor: pointer;
+}
+
+/**
+ * 1×1 的"方格纸"。
+ *
+ * ★ `aspect-ratio: 1` 保证画布是**正方形** —— 归一化坐标 `[-0.5,0.5]`
+ *   映射上去才是等比，房间不会被拉成长方形。
+ *   JS 里算拖动增量也依赖这一点（宽高用同一个基准）。
+ */
+.ns-floor-canvas {
+  position: relative;
+  aspect-ratio: 1;
+  width: 100%;
+  max-width: 190px;
+  background:
+    linear-gradient(var(--border) 1px, transparent 1px) 0 0 / 100% 25%,
+    linear-gradient(90deg, var(--border) 1px, transparent 1px) 0 0 / 25% 100%,
+    var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  touch-action: none;           /* ★ 不写这句，手机上拖房间会变成滚页面 */
+  cursor: crosshair;
+}
+
+/** 楼栋外墙 = `[-0.5, 0.5]` 那个框，画得比内部格线重一点。 */
+.ns-room-frame { position: absolute; inset: 0; }
+
+.ns-room {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px;
+  background: var(--primary-soft);
+  border: 1px solid var(--primary);
+  border-radius: 3px;
+  overflow: hidden;
+  cursor: move;
+  touch-action: none;
+  user-select: none;
+}
+.ns-room .ns-room-label {
+  font-size: 9px;
+  line-height: 1.1;
+  color: var(--text);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  pointer-events: none;         /* ★ 否则点击落在 label 上，拖不动 */
+}
+.ns-room.dragging { opacity: .8; z-index: 5; }
+
+/** 松手才落库，拖动过程只改样式 —— 这里给个"正在拖"的即时反馈。 */
+.ns-room.ghost-room {
+  background: var(--primary-soft);
+  border-style: dashed;
+  opacity: .6;
+  pointer-events: none;
+}
+
+.ns-room-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 9px;
+  height: 9px;
+  background: var(--primary);
+  cursor: nwse-resize;
+  touch-action: none;
+  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+}
+
+/* 窄屏：右栏放不下左右并排，改上下 */
+@media (max-width: 1100px) {
+  .ns-left { width: 250px; }
+  .ns-right { width: 270px; }
+  .ns-floor-grid { grid-template-columns: 1fr; }
+  .ns-room-list { max-height: 140px; }
+  .ns-floor-canvas { max-width: 100%; }
+}
+
+/* ---------------------------------------------------------------- 窄屏（手机 / 小窗口）
+
+   ## ★★ 2026-10-12 补：原来**没有**这一档，窄屏下地图是**零宽**的
+
+   三栏里左 300 + 右 320 都是 `flex: none`（固定宽），中间那个地图栏是
+   `flex: 1; min-width: 0`。所以在 375px 的手机上：
+
+       300 + 320 = 620 > 375   →   地图栏分到的是 **0 宽**
+
+   而 `#ns-map` 是 `position:absolute; inset:0` —— 父级 0 宽，它就是 0 宽。
+   **用户看到的就是"一片空白"**，而且完全看不出是布局问题
+   （他只会以为是地图没加载出来，然后去折腾 Key）。
+
+   修法：窄屏改成**单列堆叠**，并给地图一个**真实的像素高度**
+   （`height: 46vh` 而不是靠 flex 分 —— 堆叠之后没有可分的空间了）。
+   `.ns-map-wrap` 用 `order` 提到最前面：用户是来"看地图标注"的，
+   地图该在第一屏，而不是滚过两个面板才看到。
+   ------------------------------------------------------------------------- */
+@media (max-width: 820px) {
+  /* 整页可滚：堆叠之后总高度会超过一屏 */
+  html, body { overflow: auto; }
+  .ns-shell { height: auto; min-height: 100%; }
+
+  .ns-body { flex-direction: column; }
+
+  /* 地图排到最前面，并给一个**确定的**高度（不能再靠 flex 分） */
+  .ns-map-wrap {
+    order: -1;
+    flex: none;
+    width: 100%;
+    height: 46vh;
+    min-height: 260px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ns-left, .ns-right {
+    width: auto;
+    flex: none;
+    max-height: none;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  /* 顶栏那一排按钮在窄屏会挤成一团 —— 允许换行 */
+  .ns-topbar { flex-wrap: wrap; row-gap: 6px; }
+  .ns-topbar-mid { flex: 1 1 100%; text-align: left; }
+}
+
+/* ---------------------------------------------------------------- 按钮 */
+
+button {
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+button:hover { background: var(--surface-2); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+
+button.primary {
+  background: var(--primary);
+  color: var(--primary-fg);
+  border-color: var(--primary);
+}
+button.primary:hover { filter: brightness(1.08); }
+
+button.ghost { background: transparent; }
+button.ghost:hover { background: var(--surface-2); }
+
+button.small { padding: 3px 8px; font-size: 11px; }
+button.danger { color: var(--danger); border-color: var(--danger); }
+button.danger:hover { background: var(--danger-soft); }
+
+/* ---------------------------------------------------------------- 列表 */
+
+.ns-list { flex: 1; overflow-y: auto; margin-top: 4px; }
+
+.ns-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.ns-item:hover { background: var(--surface-2); }
+.ns-item.active {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+}
+
+.ns-item-main { flex: 1; min-width: 0; }
+.ns-item-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ns-item-sub {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ns-item-flag { flex: none; font-size: 11px; }
+.ns-item-flag.ok { color: var(--teal); }
+.ns-item-flag.no { color: var(--danger); }
+
+.ns-empty {
+  padding: 20px 10px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.ns-editor-empty {
+  padding: 40px 16px;
+  text-align: center;
+  color: var(--muted);
+}
+.ns-editor-empty-icon { font-size: 34px; margin-bottom: 8px; }
+.ns-editor-body { padding: 2px; }
+
+/* ---------------------------------------------------------------- 地图上的浮层 */
+
+/* ==========================================================================
+   地图区浮层的层级（2026-10-13 深夜修，用户报的"被挡住点不了"）
+   ==========================================================================
+
+   用户的原话：
+
+   > "还是一样，感觉**被什么东西挡住了，点不了**，
+   >  我指的是地图左上角那个选择加点描轮廓、设置点批量之类的那个按钮。"
+
+   ## 根因
+
+   腾讯 GL 会往 `#ns-map` 里塞一个 **`z-index: 1000`** 的覆盖层（这句话在
+   `.ns-map-wrap` 那段注释里早就写着）。而 `#ns-map` 自己是
+   `position:absolute; inset:0`、**没有 z-index** —— 它**不建层叠上下文**，
+   于是那个 1000 会和工具条的 z-index **在同一个上下文里比大小**：
+
+        main.ns-map-wrap   z-index: 0   ← 层叠上下文建在这儿
+          ├─ #ns-map       无 z-index → 腾讯那个 1000 跑到这一层
+          ├─ #ns-toolbar   z-index: 6   ← **6 < 1000，被盖住**
+          └─ #ns-map-tools z-index: 6   ← 同上
+
+   ⚠️ `.ns-map-wrap` 上那个 `z-index: 0` 解决的是"地图内部的层跑到**页面**上去"
+      （把 modal / toast 盖住那次）—— 但**它管不了容器内部自己人之间**的先后。
+      这两件事长得像，其实是两回事。当时只解决了前者，工具条一直是坏的。
+
+   ## 现在的层级
+
+       地图内部 SDK 的覆盖层              1000（腾讯的，改不了）
+       地图区浮层（工具条 / 批量条 / 右上角
+         两钮 / 底部提示 / 描轮廓条）      1100   ← 全部抬到 1000 以上
+       Key 遮罩 .ns-gate                 1200   ← 要能盖住上面那一圈
+       弹层 .ns-modal                    3000
+       提示条 .ns-toast                  3100
+
+   ⚠️ 浮层抬到 1100 **不会**跑出 `.ns-map-wrap` —— 那边有层叠上下文兜着。
+   ⚠️ 以后往地图上加任何浮层，z-index 一律用 **1100** 这一档，别再写个位数。
+   ⚠️ 这条有 e2e 盯着：`tmp/e2e-studio-boot.cjs` 会往地图容器里插一个
+      `z-index:1000` 的层，然后要求"点工具条必须真的点到工具条"。
+   ========================================================================== */
+
+.ns-map-tip {
+  position: absolute;
+  z-index: 1100;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  border-radius: 20px;
+  background: rgba(0, 0, 0, .72);
+  color: #fff;
+  font-size: 12px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.ns-map-tip b { color: #ffd479; }
+
+/* 描轮廓那条浮动操作条（2026-10-13 晚）——
+   贴在底部提示条**上面**（bottom:46px），别盖住它。
+   z-index 7：高于工具条（6），低于 Key 遮罩（10）—— 和别的浮层同一层。 */
+.ns-shape-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 46px;
+  transform: translateX(-50%);
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, .8);
+  color: #fff;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.ns-shape-bar-text b { color: #ffd479; }
+.ns-shape-bar button { flex: none; }
+/* ⚠️ 点数不够时「完成」是**禁用**的（而不是点了才告诉你不够）——
+   按钮灰着本身就是一句说明。 */
+.ns-shape-bar button:disabled { opacity: .4; cursor: default; }
+
+.ns-gate {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  z-index: 1200;
+}
+.ns-gate-box {
+  width: min(440px, calc(100vw - 32px));
+  max-width: calc(100% - 32px);
+  padding: 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+/* ★ 2026-10-12：没有 JS Key 时的退路（"先不用地图，直接填坐标"）。
+   它必须**看起来像一条退路**而不是主路径 —— 主路径仍然是配 Key 看地图。 */
+.ns-gate-alt {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.ns-gate-alt .ns-hint {
+  margin: 0;
+  line-height: 1.6;
+}
+.ns-gate-box a { color: var(--primary); }
+.ns-gate-icon { font-size: 34px; text-align: center; margin-bottom: 8px; }
+.ns-gate-box h3 { margin: 0 0 8px; font-size: 15px; text-align: center; }
+.ns-gate-box p { margin: 0 0 12px; font-size: 12px; color: var(--muted); line-height: 1.7; }
+.ns-gate-tip { margin-top: 12px !important; padding-top: 10px; border-top: 1px solid var(--border); }
+
+/**
+ * 「腾讯原话」那一段。
+ *
+ * ★ 2026-10-12 加：Key 被拒时，SDK 只说一句 `鉴权失败：…`。把它**原样**
+ *   展示出来，比我们转述十句都有用 —— 用户拿这句话去搜就能搜到答案。
+ *   ⚠️ 用等宽 + 可换行：这类报错里常有 Key 片段和英文，比例字体看着费劲。
+ */
+.ns-err-detail {
+  display: block;
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--text);
+  word-break: break-all;
+}
+
+/* ---------------------------------------------------------------- 弹层 */
+
+.ns-modal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, .5);
+  /* ⚠️ 必须**高于腾讯地图内部那些 1000**（2026-10-13）。
+     原来写的是 100 —— 地图那个 1000 跑到了根层级，把整个弹层盖住，
+     表现是"对话框看得见、按钮点不动"。
+     .ns-map-wrap 那边已经加了 z-index:0 建层叠上下文，这里是第二道保险。 */
+  z-index: 3000;
+}
+.ns-modal-box {
+  width: 560px;
+  max-width: calc(100% - 32px);
+  max-height: calc(100% - 48px);
+  overflow-y: auto;
+  padding: 22px;
+  background: var(--surface);
+  border-radius: 12px;
+}
+.ns-modal-box h3 { margin: 0 0 12px; font-size: 16px; }
+
+.ns-steps { margin: 0 0 12px; padding-left: 20px; }
+.ns-steps li { margin-bottom: 8px; font-size: 13px; line-height: 1.7; }
+
+.ns-modal-box code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+}
+
+/* ==========================================================================
+   「识别结果 / 确认名字」面板（2026-10-13 晚）
+   ==========================================================================
+
+   用户的原话："识别效果特别差，也不知道在识别什么。还有就是确认的话
+   也没有个统一的界面吧。整个操作非常的混乱。"
+
+   所以这个面板要一眼看懂三件事：
+     · 这是**第几栋**楼（左边那个数字，和列表里的序号对得上）
+     · 它**原来叫什么**（灰色那串）
+     · 附近**还有哪些地名**、各有多远（每行一个，点一下就选中）
+
+   机器只负责排序，点哪一个是用户的事。
+   ========================================================================== */
+
+.ns-poi-box { width: 660px; }
+
+.ns-poi-list {
+  max-height: 52vh;
+  overflow-y: auto;
+  margin: 10px 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.ns-poi-row { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.ns-poi-row:last-child { border-bottom: 0; }
+
+.ns-poi-who {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 序号：和左边列表里那个序号是同一个数，用来对上是哪一栋 */
+.ns-poi-idx {
+  flex: none;
+  min-width: 20px;
+  height: 20px;
+  line-height: 20px;
+  text-align: center;
+  border-radius: 6px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.ns-poi-cur { color: var(--text); font-weight: 600; }
+.ns-poi-pos { font-family: Consolas, "Courier New", monospace; font-size: 11px; }
+
+.ns-poi-opt {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  margin: 3px 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.ns-poi-opt:hover { background: var(--surface-2); }
+/* ⚠️ 选中态用 JS 加 `.on` 类，不用 `:has()` —— 那个选择器在新一点的
+   Chromium 上才有，而这个页面要在用户随便一台机器上都能用。 */
+.ns-poi-opt.on { border-color: var(--primary); background: var(--primary-soft); }
+.ns-poi-opt small { color: var(--muted); font-size: 11px; }
+.ns-poi-opt input { flex: none; }
+
+.ns-poi-acts { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* ==========================================================================
+   撤销 / 重做 + 「⋯ 更多」+ 左栏整理（2026-10-13 晚，界面重构）
+   ========================================================================== */
+
+/* 顶栏那两个图标钮：比文字钮窄，字号大一点，让它像"按钮"而不是"一字串" */
+.ns-hbtn {
+  min-width: 34px;
+  font-size: 15px;
+  line-height: 1;
+  padding: 6px 8px;
+}
+/* ⚠️ disabled 态要**看得出来** —— 否则两个按钮永远是"能点"的样子，
+   用户按下去只看到一句"没有可撤销的了"（那比不能按更让人糊涂）。 */
+.ns-hbtn:disabled { opacity: .35; cursor: default; }
+
+/* 「⋯ 更多」：一个下拉。用 `position:relative` 包住菜单，
+   菜单挂在它下面（右上角对齐）。 */
+.ns-more { position: relative; }
+.ns-more-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  min-width: 218px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .18);
+}
+.ns-more-menu button {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.ns-more-menu button:hover { background: var(--surface-2); }
+.ns-more-menu hr { border: 0; border-top: 1px solid var(--border); margin: 5px 4px; }
+
+/* 左栏：把"整理"这类偶尔用的动作收进一个折叠块 */
+.ns-tidy {
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.ns-tidy summary {
+  padding: 8px 11px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.ns-tidy[open] summary { color: var(--text); }
+.ns-tidy > .ns-cta {
+  margin-bottom: 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+}
+
+/* ⚠️ `.ns-tidy` 是块级元素，`[hidden]` 本来就能生效；写这一条是因为
+   下面 `.ns-tidy > .ns-cta` 那类规则一旦有人给它加上 `display:`，
+   `hidden` 就会**静默失效**（同优先级、作者样式在后）—— 这个坑今天已经踩过一次了。 */
+.ns-tidy[hidden] { display: none; }
+
+/* ---- 「清空全部」（2026-10-13 晚） ----
+ *
+ * ⚠️ 它是这一页里**唯一一个"全删"**的按钮，所以必须一眼看上去就不一样：
+ *    红色边框 + 红色标题。混在另外两条"整理"里长得一样的话，
+ *    用户会当成普通清理点下去 —— 而它连标定原点一起清。
+ */
+.ns-cta.danger { border-color: var(--danger); }
+.ns-cta.danger .ns-cta-icon { background: var(--danger-soft); }
+.ns-cta.danger b { color: var(--danger); }
+.ns-cta.danger small { color: var(--danger); opacity: .75; }
+
+/* ==========================================================================
+   地图标注层（2026-10-13 深夜）
+   ==========================================================================
+
+   六种 kind 共用一套骨架（位置 / 尺寸 / 旋转 / 颜色），只是"长什么样"不同：
+   加第七种的时候不用动数据层、不用动格式、不用动门禁，只加一段 CSS。
+
+   ⚠️ z-index 1100 —— 和工具条同一档（腾讯那层 1000 在下面）。
+      靠 DOM 顺序分先后：这一层在工具条**之前**，所以工具条压得住它。
+   ========================================================================== */
+
+.ns-mark-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1100;
+  /* ⚠️ 层本身不吃事件 —— 只有标注本身（下面那行）吃。
+     不这么写的话，一层透明的 DOM 会把整张地图的点击全挡住。 */
+  pointer-events: none;
+}
+
+.ns-mark {
+  position: absolute;
+  pointer-events: auto;
+  transform: translate(-50%, -50%);
+  cursor: grab;
+  user-select: none;
+  white-space: nowrap;
+  line-height: 1.2;
+  font-size: 12px;
+}
+.ns-mark.on { outline: 2px dashed var(--primary); outline-offset: 2px; }
+.ns-mark:active { cursor: grabbing; }
+
+/* ① 文字：带一圈描边，压在任何底色上都看得清 */
+.ns-mark-text {
+  padding: 2px 5px;
+  color: var(--mk);
+  font-weight: 600;
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, .9),
+    0 0 3px rgba(0, 0, 0, .8),
+    0 0 6px rgba(0, 0, 0, .6);
+}
+
+/* ② 气泡：圆角 + 小尾巴（尾巴用伪元素画，不占布局） */
+.ns-mark-bubble {
+  padding: 4px 9px;
+  border-radius: 10px;
+  background: var(--mk);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .3);
+}
+.ns-mark-bubble::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 0;
+  height: 0;
+  margin-left: -5px;
+  border: 5px solid transparent;
+  border-top-color: var(--mk);
+  border-bottom: 0;
+}
+
+/* ③ 门牌：白底小牌子（可拉伸，宽高由 w/h 给） */
+.ns-mark-plate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  padding: 3px 7px;
+  border: 2px solid var(--mk);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--mk);
+  font-weight: 700;
+  letter-spacing: .5px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .28);
+}
+
+/* ④ 贴纸：一个图形（可拉伸 + 可旋转，尺寸同样由 w/h 给） */
+.ns-mark-sticker {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, .35));
+}
+
+/* ⑤ 入口：圆点 + 文字（绿） */
+.ns-mark-entry {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px 2px 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .95);
+  border: 1.5px solid var(--mk);
+  color: var(--mk);
+  font-weight: 600;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .25);
+}
+.ns-mark-entry::before {
+  content: '';
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--mk);
+}
+
+/* ⑥ 楼梯：阶梯图标 + 文字（紫） */
+.ns-mark-stairs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px 2px 5px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .95);
+  border: 1.5px dashed var(--mk);
+  color: var(--mk);
+  font-weight: 600;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .22);
+}
+
+/* ---- 形状微调：三条滑条（2026-10-13 深夜） ----
+ *
+ * 用户要的是"单独点 / 滑条 + 加减按键"。三条各占一行：
+ *   宽  [−] ──●──── [+ ]  24.5 米
+ * 数字用 `tabular-nums` 对齐，拖动时不会左右抖。
+ */
+.ns-dims { display: flex; flex-direction: column; gap: 7px; }
+.ns-dim { display: flex; align-items: center; gap: 6px; }
+.ns-dim > b {
+  flex: none;
+  width: 32px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.ns-dim > input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--primary);
+}
+.ns-dim > button { flex: none; padding: 3px 8px; line-height: 1; }
+.ns-dim > em {
+  flex: none;
+  width: 62px;
+  text-align: right;
+  font-size: 12px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+/* 左栏搜索框 */
+.ns-list-q {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 11px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+}
+.ns-list-q:focus { outline: 2px solid var(--primary-soft); border-color: var(--primary); }
+
+.ns-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 52px;
+  transform: translateX(-50%);
+  padding: 9px 18px;
+  border-radius: 20px;
+  background: rgba(0, 0, 0, .82);
+  color: #fff;
+  font-size: 13px;
+  /* ⚠️ 同 .ns-modal：原来 200，会被地图内部的 1000 盖住 */
+  z-index: 3100;
+  max-width: 80%;
+  text-align: center;
+}
+
+/* 窄屏：三栏叠成上下（笔记本接小屏时还能用） */
+@media (max-width: 1100px) {
+  .ns-left { width: 250px; }
+  .ns-right { width: 270px; }
+}
+/* ==========================================================================
+   3D 建模相关的新组件 + 整体观感优化（2026-10-13）
+   ==========================================================================
+
+   用户的原话："还有对应的标注平台，你再优化一下，长得太难看了，
+   我的标注工作做得太辛苦了"
+
+   ## 这次改的三件事
+
+   ① **把"点选建楼"做成一个显眼的主按钮**（`.ns-cta`）——
+      它是这个工具最常做的动作，原来藏在"双击地图"这种隐性操作里。
+   ② **类别改成色块图例**（`.ns-legend`）—— 用户要的是"教学楼蓝、宿舍粉"，
+      看到色块才知道点下去手机端会变成什么颜色；下拉框里只有字。
+   ③ **整体收紧留白、拉开层级** —— 原来所有卡片长一个样、按钮一样大，
+      眼睛找不到重点。
+   ========================================================================== */
+
+/* ---------------------------------------------------------------- 徽标 */
+
+.ns-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- 主按钮（点选建楼）
+
+   它是这个工具**最常做的动作**，所以：
+   · 比普通按钮高（56px）、有图标、有主副两行字
+   · 用主色实心（不是描边）—— 一眼看出"这个是要点的主路径"
+   · 开着的时候换成绿底 + 边框（它是**模式**，状态要看得见） */
+
+.ns-cta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border: 1px solid var(--primary);
+  border-radius: 10px;
+  background: var(--primary);
+  color: var(--primary-fg);
+  text-align: left;
+  cursor: pointer;
+}
+.ns-cta:hover { filter: brightness(1.06); }
+.ns-cta-icon {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .2);
+  font-size: 18px;
+  font-weight: 600;
+}
+.ns-cta-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.ns-cta-text b { font-size: 13px; font-weight: 600; }
+.ns-cta-text small { font-size: 11px; opacity: .85; line-height: 1.35; }
+
+/* 开着的时候：换成"正在进行"的绿色 */
+.ns-cta.on {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: #fff;
+}
+.ns-cta.on .ns-cta-icon { background: rgba(255, 255, 255, .25); }
+
+/* ---------------------------------------------------------------- 类别色块图例 */
+
+.ns-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 4px;
+}
+.ns-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.ns-legend-item:hover { background: var(--surface-2); }
+.ns-legend-item i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex: none;
+}
+.ns-legend-item.active {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-soft);
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- 微调按钮组 */
+
+.ns-nudge {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 4px;
+}
+.ns-nudge button {
+  flex: 1 1 auto;
+  min-width: 56px;
+  padding: 5px 8px;
+  font-size: 11.5px;
+  border-radius: 7px;
+}
+
+/* ---------------------------------------------------------------- 折叠区（不规则形状） */
+
+.ns-details {
+  margin-top: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+.ns-details > summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--muted);
+  list-style: none;
+  user-select: none;
+}
+.ns-details > summary::-webkit-details-marker { display: none; }
+.ns-details > summary::before { content: '▸ '; }
+.ns-details[open] > summary::before { content: '▾ '; }
+.ns-details > summary:hover { color: var(--text); }
+.ns-details > *:not(summary) { margin-top: 6px; }
+
+/* ---------------------------------------------------------------- 地图右上角的浮动按钮 */
+
+.ns-map-tools {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ns-map-tools button {
+  padding: 7px 11px;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .94);
+  color: #1f2023;
+  font-size: 12px;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .22);
+}
+.ns-map-tools button:hover { background: #fff; }
+
+/* ---------------------------------------------------------------- 整体观感
+
+   ① **卡片之间拉开**：原来 8px 太挤，一屏里所有卡片糊成一片
+   ② **滚动条收窄**：默认的 15px 宽在侧栏里非常抢眼
+   ③ **主色描边加深**：原来浅灰的边框让"哪块是哪块"分不清 */
+
+.ns-left, .ns-right { scrollbar-width: thin; }
+.ns-left::-webkit-scrollbar,
+.ns-right::-webkit-scrollbar,
+.ns-list::-webkit-scrollbar,
+.ns-room-list::-webkit-scrollbar { width: 8px; }
+.ns-left::-webkit-scrollbar-thumb,
+.ns-right::-webkit-scrollbar-thumb,
+.ns-list::-webkit-scrollbar-thumb,
+.ns-room-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.ns-left::-webkit-scrollbar-thumb:hover,
+.ns-right::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+.ns-card { box-shadow: 0 1px 2px rgba(0, 0, 0, .04); }
+.ns-card + .ns-card { margin-top: 2px; }
+
+/* 3D 建模那张卡是**当前的主战场**，给它一点视觉分量 */
+.ns-shape-card { border-color: var(--primary-soft); }
+
+/* ---------------------------------------------------------------- 次要的主按钮（点选补一栋）
+
+   ⚠️ 它和 `.ns-cta` 同级（一样大、一样有图标），但**描边而不是实心** ——
+      因为主路径已经变成"从 OSM 导入"了。两个都做成实心的话，
+      用户会不知道先点哪个。 */
+
+.ns-cta.ghost {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+  margin-top: 8px;
+}
+.ns-cta.ghost:hover { background: var(--surface-2); filter: none; }
+.ns-cta.ghost .ns-cta-icon {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+.ns-cta.ghost.on {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: #fff;
+}
+.ns-cta.ghost.on .ns-cta-icon { background: rgba(255, 255, 255, .25); color: #fff; }
+
+/* ===========================================================================
+   2026-10-13：步骤条 / 折叠的包信息 / 一键发布
+   用户原话"目前真的很反人类"。三条对应关系：
+     · .ns-steps-bar  —— 这一页原来**没有"我现在该干嘛"**，一进来就被要求配 Key
+     · .ns-pack-fold —— 包信息原来在**最上面**，而它是最后一步才填的
+     · .ns-pub-*     —— 原来只有"下载文件"，没有"发布"
+   =========================================================================== */
+
+/* 顶栏那条两步进度 */
+.ns-steps-bar { display: flex; align-items: center; gap: 6px; margin-right: 12px; }
+.ns-step {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 12px; color: var(--muted);
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.ns-step b {
+  display: inline-block; width: 15px; height: 15px; line-height: 15px;
+  text-align: center; border-radius: 50%;
+  background: var(--muted); color: #fff; font-size: 10px; font-weight: 500;
+}
+/* 正在做的那一步：亮起来。⚠️ 只亮**当前**那一步，两步都亮等于没指示 */
+.ns-step.on { color: var(--primary); border-color: var(--primary); background: var(--primary-soft); }
+.ns-step.on b { background: var(--primary); }
+/* 做完了：打勾感（用实心圆点，不引入图标字体） */
+.ns-step.done { color: var(--teal); border-color: var(--teal); }
+.ns-step.done b { background: var(--teal); }
+
+/* 折叠的"数据包信息" */
+.ns-pack-fold { padding: 0; }
+.ns-pack-fold > summary {
+  list-style: none; cursor: pointer; padding: 12px 14px;
+  display: flex; align-items: center; gap: 6px;
+}
+.ns-pack-fold > summary::-webkit-details-marker { display: none; }
+/* ⚠️ 折叠箭头用伪元素而不是图标字体 —— 右键"检查"里能看出状态，
+   而且不依赖任何外部字体加载 */
+.ns-pack-fold > summary::before { content: "▸"; font-size: 11px; color: var(--muted); }
+.ns-pack-fold[open] > summary::before { content: "▾"; }
+.ns-fold-body { padding: 0 14px 14px; }
+
+/* ---- 发布弹层 ---- */
+.ns-publish-box { width: 480px; }
+.ns-pub-check {
+  font-size: 12px; line-height: 1.6; padding: 9px 11px; border-radius: var(--radius);
+  background: var(--surface-2); color: var(--muted); margin-bottom: 12px;
+}
+.ns-pub-check.warn { background: #faeeda; color: #633806; }
+.ns-pub-grid { display: flex; gap: 8px; margin-bottom: 14px; }
+.ns-pub-kv {
+  flex: 1; padding: 8px 10px; border-radius: var(--radius);
+  background: var(--surface-2); min-width: 0;
+}
+.ns-pub-kv span { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+.ns-pub-kv b { display: block; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ns-pub-msg { font-size: 12px; line-height: 1.6; margin: 10px 0 0; min-height: 18px; }
+.ns-pub-msg.bad { color: var(--danger); }
+.ns-pub-msg.good { color: var(--teal); }
+.ns-pub-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.ns-pub-done { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.ns-pub-done p { font-size: 13px; line-height: 1.7; margin: 0 0 8px; }
+.ns-pub-code {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; border-radius: var(--radius);
+  background: var(--primary-soft); border: 1px solid var(--primary);
+}
+.ns-pub-code code {
+  flex: 1; font-size: 15px; font-weight: 500; color: var(--primary);
+  background: none; padding: 0; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ===========================================================================
+   2026-10-13 第二轮：工具条 / 批量条 / 色卡 / 名字状态
+
+   用户这一轮要的四件事都在这几个类里：
+     · 工具（选择/加点/描轮廓/设原点/批量）—— 见 .ns-toolbar / .ns-tool
+     · 地图上直接选中、拖动              —— 见 .ns-item.picked（批量勾选态）
+     · 颜色选择更现代                    —— 见 .ns-legend-item（改成色卡）
+     · 二次识别的黄叹号 → 绿勾            —— 见 .ns-item-flag.poi
+   =========================================================================== */
+
+/* ---- 地图左上角的工具条 ---- */
+/* ⚠️ `left: 12px; top: 12px` 而不是跟着 `#ns-map-tools`（那个在右上）——
+      两边放一起的话，工具条一变长就会和 2D/看全部 挤在一行。 */
+.ns-toolbar {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .92);
+  box-shadow: 0 2px 10px rgba(15, 23, 42, .16);
+}
+.ns-tool {
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 12px;
+  font: 13px/1.2 inherit;
+  text-align: left;
+  cursor: pointer;
+  background: transparent;
+  color: #334155;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ns-tool:hover { background: #eef2f7; }
+/* 当前工具：底色 + 加粗。⚠️ 只给"当前"那一个上色，两个都亮等于没指示。 */
+.ns-tool.on { background: #185fa5; color: #fff; font-weight: 600; }
+.ns-tool b {
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .28);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ---- 底部的批量操作条 ---- */
+.ns-batch-bar {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  z-index: 1100;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .96);
+  box-shadow: 0 3px 14px rgba(15, 23, 42, .2);
+}
+.ns-batch-bar.hidden { display: none; }
+.ns-batch-n { font-size: 12px; color: var(--muted); margin-right: 2px; }
+.ns-batch-sep { width: 1px; height: 18px; background: var(--border); }
+.ns-batch-bar select {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 8px;
+  font: 12px inherit;
+  background: #fff;
+}
+.ns-batch-bar button {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: 12px inherit;
+  cursor: pointer;
+  background: #185fa5;
+  color: #fff;
+}
+.ns-batch-bar button.ghost { background: #eef2f7; color: #334155; }
+.ns-batch-bar button.ghost.danger { background: #fdecec; color: #b42318; }
+
+/* ---- 类别色卡（原来的小色块改成"大色块 + 名字 + 选中打勾"）---- */
+.ns-legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 6px;
+}
+.ns-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px 8px;
+  background: #fff;
+  color: #334155;
+  font: 12px inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.ns-legend-item:hover { border-color: #94a3b8; }
+.ns-legend-item.active { border-color: #185fa5; box-shadow: 0 0 0 2px rgba(24, 95, 165, .18); font-weight: 600; }
+/* 色块本身就是"手机端会变成什么颜色"的预览，所以要够大 */
+.ns-legend-item i {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 12px;
+  font-style: normal;
+}
+.ns-legend-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- 名字状态那个小标记：四态 ---- */
+/* ✓ 绿勾  名字已确认（自己填的 / 点过确认）
+   ! 黄叹号 二次识别自动填的，等你看一眼  ← 用户点名要的那个
+   ? 灰问号 有坐标但没名字
+   ! 红叹号 连坐标都没有 */
+
+/* ⚠️⚠️ 2026-10-13 下午：黄叹号从"一个 11px 的黄字"改成**看得见的黄标**。
+ *
+ * 用户的原话："没找到对应的控件或者说按钮。"
+ *
+ * 他刚做完二次识别，屏幕上那条提示让他"点黄叹号确认" —— 而那个"黄叹号"
+ * 当时只是列表项右边一个 11px 的字：没底色、没边框、混在一行小字里，
+ * 看着跟个标点差不多。
+ *
+ * **唯一入口长成了看不见的样子，那这个入口就等于不存在。**
+ * 现在给它一个圆角底色块：一眼能看见，指针移上去还会亮一下（可点的暗示）。
+ */
+.ns-item-flag.poi {
+  color: #f59e0b;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, .18);
+  border: 1px solid rgba(245, 158, 11, .55);
+}
+.ns-item-flag.poi:hover { color: #fbbf24; background: rgba(245, 158, 11, .34); }
+.ns-item-flag.noname { color: var(--muted); }
+
+/* ---- 「待确认 N」那个常驻入口（2026-10-13 下午加） ----
+ *
+ * ⚠️ 它和提示条上那个「全部确认」按钮是**同一件事的两个入口**，都要有：
+ *    · 提示条上的：用户刚做完识别，眼睛还在屏幕中间，就近点掉
+ *    · 这里这个：提示条 6 秒后就消失了，而"还有几个名字没看"这件事
+ *      不该跟着一起消失（用户可能先去改了个名字、回来就找不到了）
+ */
+.ns-confirm-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  margin-right: 6px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, .55);
+  background: rgba(245, 158, 11, .16);
+  color: #f59e0b;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ns-confirm-all:hover { background: rgba(245, 158, 11, .32); color: #fbbf24; }
+
+/* 「取消选择」—— 它和「删除」都要贴右边，所以把空隙吃在它左边。
+   （`.ns-card-head` 是 space-between，三样东西会散开：标题 | 取消 | 删除） */
+.ns-card-head .ns-unsel { margin-left: auto; margin-right: 6px; }
+
+/* ⚠️⚠️ `[hidden]` 必须显式写回来。
+ *
+ * 浏览器给 `hidden` 属性的默认样式是 `[hidden]{display:none}`，它的优先级
+ * 和一个类选择器**一样（0,1,0）**，而作者样式表排在 UA 样式表后面 ——
+ * 所以只要组件类里写了 `display: flex`，`el.hidden = true` 就**根本不生效**。
+ *
+ * 这个坑项目里已经踩过：左边那个「自动补上真实轮廓」「清掉没名字的」用的
+ * 就是 `btn.hidden = true`（见 `nsRefreshFill` / `nsRefreshPrune`），
+ * 而 `.ns-cta` 有 `display: flex` —— 于是它们**该藏的时候一直显示着**，
+ * 上面还写着"（0 栋）"。用户看到的就是一堆不知道什么时候该用的按钮。
+ *
+ * 修在一处（这里），比在 JS 里改成 `classList.toggle('hidden')` 稳 ——
+ * 后者要改两个函数，而且下次谁再写 `el.hidden` 又会踩一遍。
+ */
+.ns-cta[hidden],
+.ns-confirm-all[hidden] { display: none; }
+/* 提示条里那个按钮：和提示文字同一行，要更紧凑 */
+.ns-toast .ns-toast-act {
+  margin-left: 10px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, .7);
+  background: rgba(245, 158, 11, .22);
+  color: #fbbf24;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.ns-toast .ns-toast-act:hover { background: rgba(245, 158, 11, .4); }
+
+/* ---- 批量勾选框 + 勾选中的行 ---- */
+.ns-item-check {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border: 1.5px solid #cbd5e1;
+  border-radius: 5px;
+  margin-right: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: #fff;
+}
+.ns-item-check.on { background: #185fa5; border-color: #185fa5; }
+.ns-item.picked { background: #eef4fb; }
+
+/* 二次识别那个按钮：两个入口共用，所以用类 */
+.ns-poi-btn { width: 100%; }
+
+/* 标注类型那六个小按钮（2026-10-13 深夜） */
+.ns-mark-kinds { display: flex; flex-wrap: wrap; gap: 5px; }
+.ns-mark-kind {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.ns-mark-kind:hover { border-color: var(--primary); }
+.ns-mark-kind.on {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-weight: 600;
+}

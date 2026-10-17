@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>外观标注台</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  html, body { height: 100%; }
+  body.pl-body { display: flex; flex-direction: column; overflow: hidden; }
+  .pl-top { display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+  .pl-tabs { display: flex; gap: 4px; background: var(--bg); padding: 3px; border-radius: 10px; }
+  .pl-tabs button { border: 0; background: transparent; padding: 6px 14px; border-radius: 8px; cursor: pointer; color: var(--muted); font-weight: 500; }
+  .pl-tabs button.on { background: var(--card); color: var(--text); box-shadow: var(--shadow); }
+  .pl-spacer { flex: 1 1 auto; }
+  .pl-hint { color: var(--muted); font-size: 12.5px; }
+  .pl-pane { flex: 1 1 auto; min-height: 0; }
+  .pl-pane[hidden] { display: none !important; }
+  #pane-studio { display: flex; }
+  #pane-studio iframe { flex: 1 1 auto; border: 0; width: 100%; height: 100%; background: #fff; }
+  .pl-scroll { height: 100%; overflow: auto; padding: 18px 20px 40px; }
+  .pl-wrap { max-width: 1000px; margin: 0 auto; }
+  .pl-lead { color: var(--muted); margin: 0 0 16px; line-height: 1.7; }
+  .pl-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 16px; }
+  .pl-card > h3 { margin: 0; padding: 14px 16px; font-size: 14.5px; border-bottom: 1px solid var(--border); }
+  .pl-card > .pl-body { padding: 16px; }
+  table.pl-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.pl-table th, table.pl-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.pl-table th { color: var(--muted); font-weight: 500; font-size: 12px; background: #fafcff; }
+  table.pl-table tr:last-child td { border-bottom: 0; }
+  table.pl-table code { background: var(--bg); padding: 2px 6px; border-radius: 6px; font-size: 12.5px; }
+  .pl-badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; background: var(--primary-weak); color: var(--primary); }
+  .pl-empty { padding: 28px; text-align: center; color: var(--muted); }
+  .pl-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .pl-btn { border: 1px solid var(--border); background: var(--card); color: var(--text); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .pl-btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+  .pl-btn.danger { color: var(--danger); border-color: #f3c9c4; }
+  .pl-btn.sm { padding: 4px 9px; font-size: 12.5px; }
+  .pl-btn:disabled { opacity: .55; cursor: not-allowed; }
+  .pl-src { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+  .pl-toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); background: #16202f; color: #fff; padding: 10px 16px; border-radius: 10px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .18s; max-width: 70vw; z-index: 50; }
+  .pl-toast.show { opacity: 1; }
+  .pl-toast.err { background: var(--danger); }
+  details.pl-note { margin-top: 10px; font-size: 13px; color: var(--muted); }
+  details.pl-note summary { cursor: pointer; }
+</style>
+</head>
+<body class="pl-body">
+
+<div class="pl-top">
+  <div class="pl-tabs">
+    <button data-tab="studio" class="on">标注台</button>
+    <button data-tab="packs">外观包</button>
+  </div>
+  <div class="pl-spacer"></div>
+  <span class="pl-hint">外观这一块暂时不再加功能，接口与分发先留着</span>
+</div>
+
+<div class="pl-pane" id="pane-studio">
+  <iframe id="plStudio" src="studio.html" title="外观标注台"></iframe>
+</div>
+
+<div class="pl-pane" id="pane-packs" hidden>
+  <div class="pl-scroll">
+    <div class="pl-wrap">
+      <p class="pl-lead">
+        外观包（skinpack）改的是配色、壁纸、图标和主页布局。<b>授权码就是包标识</b>，
+        同学在设置里输这个码就能取到。这一块的功能按计划停在这里，分发链路是可用的。
+      </p>
+
+      <div class="pl-card">
+        <h3>已发布的外观包</h3>
+        <div class="pl-body" id="plPacksBody"><div class="pl-empty">加载中…</div></div>
+      </div>
+
+      <div class="pl-card">
+        <h3>上传一份现成的外观包</h3>
+        <div class="pl-body">
+          <div class="pl-row">
+            <input type="file" id="plPackFile" accept=".json,application/json">
+            <button class="pl-btn" id="plPackUpload">上传</button>
+            <label class="pl-src"><input type="checkbox" id="plPackReplace"> 允许覆盖同名授权码</label>
+          </div>
+          <details class="pl-note">
+            <summary>格式与限制</summary>
+            <div>
+              接受 <code>.skinpack.json</code>，几十 KB 以内。字段定义在
+              <code>docs/格式-外观数据包-skinpack-2026-10-14.md</code>。
+              分发接口（<code>/api/skinpacks</code>）与手机端的读取逻辑都已经在，
+              这里只是把管理和上传接到了面板上。
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="pl-toast" id="plToast"></div>
+
+<script src="wrap.js"></script>
+</body>
+</html>

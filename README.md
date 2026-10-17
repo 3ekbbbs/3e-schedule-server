@@ -99,6 +99,7 @@ schedule-server.exe -init            写入默认配置后退出
 schedule-server.exe -version         打印版本
 schedule-server.exe -no-browser      启动时不打开浏览器
 schedule-server.exe -config <路径>   指定配置文件
+schedule-server.exe -import-db <db>  把旧版本的数据迁进来（备份后替换，做完退出）
 ```
 
 图形界面版本没有控制台窗口，日志写在 `data/logs/` 下：
@@ -145,7 +146,8 @@ data/logs/console.log   子进程的标准输出
 | 账号 | 搜索、详情、封禁、管理员、删除、批量创建、邀请码 |
 | 内容审核 | 违禁词增删改、待处理举报、AI 复核配置与测试 |
 | 分发 | 安装包状态与克隆、插件审核、设备列表、联动服务器与路由 |
-| 维护 | 备份、下载、恢复、孤儿扫描、重复清理、登录日志、系统信息 |
+| 维护 | 备份、下载、从旧版本迁移、孤儿扫描、重复清理、登录日志、系统信息 |
+| 插件 | 安装 / 停用 / 卸载、上传 zip；导航标注台与外观标注台 |
 | 设置 | 天气、对象存储模板、插件市场、实时协作、部署令牌 |
 
 账号列表里的「详情」会展开这个人的日历、日程、设备和最近登录。它回答的是「删掉这个账号会连带删掉什么」。
@@ -157,6 +159,85 @@ ssh -L 9800:127.0.0.1:9800 user@your-server
 ```
 
 也可以把 `panel_listen` 改成 `0.0.0.0:9800`，但必须同时在防火墙里限制来源地址。
+
+## 插件
+
+标注台这类只有一部分人用得上的界面，不装在主程序里，而是作为面板插件存在。
+
+```
+data/panel-plugins/
+  state.json              启用状态
+  navstudio/
+    manifest.json
+    index.html
+    ...
+```
+
+`manifest.json` 的最小形状：
+
+```json
+{
+  "id": "navstudio",
+  "name": "导航标注台",
+  "version": "1.0.0",
+  "entry": "index.html",
+  "api": true
+}
+```
+
+- `id` 决定目录名与访问路径 `/plugin/<id>/`，只允许小写字母、数字、连字符。
+- 插件页面里以 `/plugin/<id>/api/...` 开头的请求由面板转发给服务核心，并换成当前会话的管理员令牌。
+- 随程序附带 `navstudio`（导航标注台）与 `skinstudio`（外观标注台）。点「安装」才展开到数据目录，卸载会真的把目录删掉。
+- 插件跑在面板的源上，权限等同于面板本身。只装你信任的来源。
+
+装好的插件出现在侧边栏的「插件」组里。停用之后页面和接口都返回 403，直连地址也不行。
+
+两个标注台都带一个「数据包」页：列出现有的 navpack / skinpack，可以复制授权码、删除、上传。导航包标完点「一键发布」，用户在客户端输授权码就能整份替换本机楼栋表。
+
+### 重新构建插件包
+
+标注台的源在网页端的 `public/` 目录里。改了那边之后：
+
+```bash
+node scripts/build-panel-plugins.mjs --from <网页端 public 目录>
+```
+
+脚本复制文件、把根路径 `/api/...` 与 `/nav-osm/...` 改写成插件前缀、断言没有漏网的，产物写到 `internal/panel/builtin/plugins/`，并打一份 zip 到 `dist/plugins/`（可以直接在面板里上传安装）。
+
+⚠️ 不要用「把 `'/api/` 全文替换」这种写法：`nav-studio.js` 里有一处 `indexOf('/api/')` 是排掉腾讯地图 SDK 脚本的资源过滤器，改掉它地图不显示。脚本里那几条替换规则都写了预期命中数，源文件变了会直接报错停下。
+
+## 从旧版本迁移
+
+旧版服务端（单独一个 exe）和新版用的是同一份表结构，所以迁移在数据层面就是换库；新版启动时会补上新增的列和表。
+
+### 步骤
+
+1. 旧服务器上停掉服务。
+2. 复制 `data/schedule.db`。同目录如果有 `schedule.db-wal` / `schedule.db-shm`，一起拿。
+3. 新版面板 → 维护 → 备份与恢复 → 选文件 → **体检**。
+4. 核对账号数、日程数、时间范围，对得上再点「确认迁移」。
+
+体检只读上传上来的临时文件，不碰当前库。确认之后依次做这些事：
+
+- 停服务
+- 当前库复制到 `data/backups/pre-migrate-<时间>.db`
+- 上传的库复制到 `data/backups/imported-<时间>.db`
+- 替换 `data/schedule.db`，启动服务
+- 重新数一遍，和导入源的账号/日程数量对账
+
+迁移完成后旧登录令牌全部失效，需要用新数据里的管理员账号重新登录。这是故意的：换了库，旧 token 在新库里不存在。
+
+### 命令行
+
+```
+schedule-server.exe -import-db "D:/old/data/schedule.db"
+```
+
+同一段逻辑，不经过 HTTP。适合没有浏览器的机器。
+
+### 出问题怎么回去
+
+面板 → 维护 → 备份，列表里会多出上面那两个文件。下载下来按同样步骤导回去即可，两份都是完整的 SQLite 库。
 
 ## 构建
 
@@ -193,6 +274,7 @@ internal/config/         配置结构与读写
 internal/certgen/        自签 CA 与服务端证书生成
 internal/panel/          管理面板后端与内嵌前端
   web/                   HTML / CSS / JS（无外部依赖）
+  builtin/plugins/       随程序附带的面板插件（标注台）
 scripts/                 构建脚本
 ```
 
@@ -205,6 +287,7 @@ data/backups/            VACUUM INTO 生成的备份
 data/logs/               日志
 data/updates/            客户端安装包与 manifest.json
 data/mirror/             联动缓存（缓存模式下从对端拉下来的文件）
+data/panel-plugins/      已安装的面板插件（每个插件一个目录）
 data/invite.txt          邀请码
 data/internal.addr       内部管理地址与令牌（0600）
 ```
@@ -213,7 +296,14 @@ data/internal.addr       内部管理地址与令牌（0600）
 
 面板里的“生成备份”使用 SQLite 的 `VACUUM INTO`，服务运行中也能得到一致性快照。
 
-恢复会停掉服务、把当前数据库另存为 `schedule.db.bak-<时间>`，再替换并重启。恢复只接受 SQLite 文件头正确的 `.db`。
+恢复会停掉服务、替换数据库并重启。替换之前会留两份东西：
+
+```
+data/backups/pre-migrate-<时间>.db   换之前这台机器上的库
+data/backups/imported-<时间>.db      这次传上来的那份
+```
+
+上传之后先做体检：文件头、必需的表、账号/日历/日程的数量、日程覆盖的时间范围。结构对不上的库直接拒绝，不会覆盖任何东西。
 
 也可以直接复制 `data/schedule.db`，但要先停止服务，否则 WAL 里未落盘的部分会丢。
 

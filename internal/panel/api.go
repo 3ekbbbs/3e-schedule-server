@@ -46,8 +46,30 @@ func (p *Panel) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/panel/deploy-token", p.auth(p.handleGetDeployToken))
 	mux.HandleFunc("POST /api/panel/deploy-token", p.write(p.handleNewDeployToken))
 
+	// 插件（标注台这类可选界面）。安装、启停、卸载都走面板会话；
+	// 插件自己的静态资源与业务接口在 /plugin/<id>/ 下，见 plugins.go。
+	mux.HandleFunc("GET /api/panel/plugins", p.auth(p.handlePluginList))
+	mux.HandleFunc("POST /api/panel/plugins/install-builtin", p.write(p.handlePluginInstallBuiltin))
+	mux.HandleFunc("POST /api/panel/plugins/upload", p.write(p.handlePluginUpload))
+	mux.HandleFunc("POST /api/panel/plugins/{id}/toggle", p.write(p.handlePluginToggle))
+	mux.HandleFunc("DELETE /api/panel/plugins/{id}", p.write(p.handlePluginUninstall))
+	mux.HandleFunc("/plugin/", p.handlePlugin)
+
 	mux.HandleFunc("GET /api/panel/proxy/", p.auth(p.handleProxy))
 	mux.HandleFunc("/", p.handleStatic)
+}
+
+// readJSON 读一个小的 JSON 请求体。失败时已经写过响应，调用方直接 return。
+func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	if r.Body == nil {
+		writeErr(w, http.StatusBadRequest, "请求体是空的")
+		return false
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(v); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式不对："+err.Error())
+		return false
+	}
+	return true
 }
 
 // ---- 鉴权 ----
@@ -464,6 +486,12 @@ func (p *Panel) handleRestore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "写入上传文件失败")
 		return
 	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		writeErr(w, http.StatusInternalServerError, "写入上传文件失败："+err.Error())
+		return
+	}
 	_ = out.Close()
 
 	// 只接受 SQLite 文件，避免把任意二进制覆盖到库上。
@@ -481,40 +509,34 @@ func (p *Panel) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wasRunning, _, _ := p.running()
-	if wasRunning {
-		if err := p.StopServer(); err != nil {
-			_ = os.Remove(tmp)
-			writeErr(w, http.StatusInternalServerError, "停止服务失败："+err.Error())
-			return
-		}
-	}
-
-	dbPath := filepath.Join(p.cfg.DataDir, "schedule.db")
-	backup := dbPath + ".bak-" + time.Now().Format("20060102-150405")
-	if _, err := os.Stat(dbPath); err == nil {
-		if err := os.Rename(dbPath, backup); err != nil {
-			_ = os.Remove(tmp)
-			writeErr(w, http.StatusInternalServerError, "备份当前数据库失败："+err.Error())
-			return
-		}
-	}
-	_ = os.Remove(dbPath + "-wal")
-	_ = os.Remove(dbPath + "-shm")
-	if err := os.Rename(tmp, dbPath); err != nil {
-		// 尽量回滚，别把用户留在“没有库”的状态。
-		_ = os.Rename(backup, dbPath)
-		writeErr(w, http.StatusInternalServerError, "替换数据库失败："+err.Error())
+	// ★ 先体检再动手。认不出结构的库直接拒绝 ——
+	// 让它覆盖上去的结果是"服务起不来，而且原来的库已经改名了"。
+	stats, err := inspectDB(tmp)
+	if err != nil {
+		_ = os.Remove(tmp)
+		writeErr(w, http.StatusBadRequest, "这个库读不出来："+err.Error())
 		return
 	}
-	if wasRunning {
-		if err := p.StartServer(); err != nil {
-			writeErr(w, http.StatusInternalServerError,
-				"数据库已替换，但服务启动失败："+err.Error()+"；原库备份在 "+backup)
-			return
-		}
+	if !stats.Compatible {
+		_ = os.Remove(tmp)
+		writeErr(w, http.StatusBadRequest, stats.SchemaNote)
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "backup": backup})
+
+	// dry=1：只报体检结果，不换库。界面上"先看一眼"走的是这条路。
+	if strings.TrimSpace(r.URL.Query().Get("dry")) == "1" {
+		_ = os.Remove(tmp)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dry": true, "stats": stats})
+		return
+	}
+
+	res, err := p.migrateFrom(tmp)
+	_ = os.Remove(tmp)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // ---- 系统信息 ----

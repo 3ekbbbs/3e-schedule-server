@@ -2,6 +2,7 @@
 data/
 certs/
 dist/
+tmp/
 tmp-test/
 *.exe
 *.dll

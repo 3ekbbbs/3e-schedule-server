@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>外观设计台 · 手机端界面</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  外观设计台（skin-studio）—— 2026-10-14 v3：**拖拽布局编辑器**。
+
+  ## 这一版和上一版的区别
+
+  上一版只能"给固定模板换色"。这一版是真正的布局编辑：
+  · **主页 = 块画布**：每个卡片/标题/文字/留白/HTML 都是独立的块，可以
+    拖拽换位、改跨度（半宽/整宽）、复制、删除 —— 形状 = 手机端 `HomeLayout`。
+  · **任意页面 = 上下块**：可以在任何页面的顶部/底部加块（6 种 kind），
+    块可以拖拽换位、跨页面移动（拖到左侧大纲的另一页上）—— 形状 = 手机端 `PageBlock`。
+  · 布局数据随外观包走（formatVersion 2，v1 包完全兼容）。
+
+  ## 和手机端"不要有差异"是怎么保证的
+
+  · 颜色：`skin-core.js` 是从手机端 `ui/Palette.kt` / `ui/UiSkin.kt` / `ui/DecorLayer.kt`
+    **逐行移植**的同一套算法（OKLab 明度换算、彩度分级、对比度达标、纹理 6%）。
+  · 布局：块的类型、字段、夹范围全部对齐手机端 `HomeBlock` / `PageBlock` 的解析
+    （包括"每页最多 8 块"、"actions 目标白名单"、"links 必须 http 开头"）。
+  · 尺寸：`.ph-*` 那一层全部走 CSS 变量，值来自皮肤。
+  · 页面：页面 id 用注册表里那个 id，所以"特定页面设计"落到手机上一定命中。
+
+  ## 界面（三栏，Photoshop 那类编辑器的骨架）
+
+  · 左 = **大纲**：整机解剖（配色/外壳/字体/纹理）+ 页面树（每页的块列表）。
+    **把块拖到某个页面上 = 把它移到那一页**。
+  · 中 = **画布**：393×852 手机模拟器，点哪个块就选中哪个，拖拽直接换位。
+  · 右 = **属性检查器**：跟着选中的对象走 —— 选中一块卡片，右边就是这块的
+    跨度/高度/配色/圆角；选中"配色"，右边就是 27 个角色。
+
+  ⚠️ 页面内容（日程、录音、单词…）是**样例数据**：设计台不连数据库。
+     插件页面**中间**那部分是插件自己画的，块只能加在它的上下 ——
+     这是刻意的（去遮别人的界面会让用户"看到功能却点不到"）。
+-->
+<!--
+  外观设计台（skin-studio）—— 2026-10-15 v5：**自由画布**。
+
+  ## 这一版和上一版最大的区别
+
+  上一版（v3/v4）是「块流」：主页 = 一块块往下排，页面 = 顶部/底部各一串块。
+  它表达力被那 6 种块钉死，而且得先理解"块 / zone / span / heightFactor"才敢动手。
+
+  **这一版默认就是自由画布**：像做 PPT 一样，把文字 / 形状 / 图片 / 图标 / 按钮 /
+  手绘 / 代码拖到 393×852 的手机画面上，随便摆、随便缩放旋转、想点哪里就给它
+  绑一个动作（跳页 / 执行功能 / 打开网址 / 自定义脚本）。
+
+  ```
+    🎨 自由画布（默认）   拖拖拽拽，门槛最低
+    🧩 高级（块流）       上一版那套，还在 —— 老设计不会丢，想用随时切
+  ```
+
+  ## 产物是怎么上手机的（这一点决定了它为什么不是"网页上的玩具"）
+
+  画布**不发明新渲染器**，它编译成**一段自包含 HTML**，交给手机端早就有的
+  `HomeBlock(type=html)` / `PageBlock(kind=html)`，由 WebView 画出来。
+  于是自由度 = CSS 能画什么就能画什么，而且**两端不存在"画布模型要同步"的负担**。
+
+  ## 界面（三栏，Photoshop 那类编辑器的骨架）
+
+  · 左 = **元素库 + 图层**：点一下加进画布（也可以拖到想要的位置）；图层可显隐/锁定/删。
+  · 中 = **画布**：393×852 手机画面，拖动换位、八向手柄缩放、圆点旋转、对齐参考线吸附。
+  · 右 = **属性检查器**：跟着选中的元素走（位置/大小/颜色/字体/动作…）。
+
+  ⚠️ 手机端 WebView **禁网** —— 图片只能内联（上传时自动转 data: URI），
+     所以一张大图会明显撑大外观包，上传时会提示体积。
+-->
+<link rel="stylesheet" href="studio.css">
+<link rel="stylesheet" href="free-canvas.css">
+</head>
+<body>
+
+<div class="ss-shell">
+
+  <!-- ===== 顶栏：全局动作 + 当前选择面包屑 ===== -->
+  <div class="ss-bar">
+    <span class="ss-brand">🎨 外观设计台</span>
+    <!-- ★ 编辑方式：自由画布（默认） / 高级（块流）。默认进自由画布 —— 门槛低的那条路放前面。 -->
+    <span class="ss-modes" id="ss-modes">
+      <button class="ss-modebtn on" data-mode="free" title="拖拖拽拽：把元素摆到手机上">🎨 自由画布</button>
+      <button class="ss-modebtn" data-mode="pro" title="上一版那套块流编辑（老设计都在这儿）">🧩 高级</button>
+    </span>
+    <!-- 自由模式下"正在画哪一页" -->
+    <select class="ss-pagesel" id="fc-page" title="在哪个页面上画"></select>
+    <span class="ss-selpath" id="ss-selpath">未选中</span>
+    <span class="ss-grow" style="flex:1"></span>
+    <span class="ss-dirty clean" id="ss-dirty">已同步</span>
+    <button class="ss-icobtn" id="ss-undo" title="撤销（Ctrl+Z）">↶</button>
+    <button class="ss-icobtn" id="ss-redo" title="重做（Ctrl+Shift+Z）">↷</button>
+    <label class="ss-note" title="预览深色/浅色"><input type="checkbox" id="ss-dark"> 深色</label>
+    <button class="ss-icobtn" id="ss-orient" title="横屏 / 竖屏（横屏 = 左栏 + 内容 + 右栏那套外壳）">▯</button>
+    <button class="ss-icobtn" id="ss-srcview" title="源码渲染：用手机端编译的同一套 Compose 组件（WasmJS）渲染当前设计">⌨</button>
+    <label class="ss-note" title="把抽屉拉出来看（竖屏主页）"><input type="checkbox" id="ss-drawer"> 抽屉</label>
+    <button class="ss-icobtn" id="ss-reset" title="清空设计">⌫</button>
+    <button class="ss-pubbtn" id="ss-publish" title="打包 / 导出 / 发布">⬆ 发布</button>
+  </div>
+
+  <div class="ss-main">
+
+    <!-- ===== 左：自由=元素库+图层 ｜ 高级=大纲 ===== -->
+    <aside class="ss-left">
+      <div id="fc-left" hidden>
+        <div class="ss-colhead">元素 <span class="ss-colhead-sub">点一下加进画布</span></div>
+        <div id="fc-lib"></div>
+        <div class="ss-colhead" style="margin-top:16px">图层 <span class="ss-colhead-sub">上面的在上层</span></div>
+        <div id="fc-layers"></div>
+      </div>
+      <div id="ss-left-pro">
+        <div class="ss-colhead">大纲 <span class="ss-colhead-sub">拖块到某页上 = 移过去</span></div>
+        <div id="ss-outline"></div>
+      </div>
+    </aside>
+
+    <!-- ===== 中：自由=画布 ｜ 高级=手机模拟器 ===== -->
+    <main class="ss-mid">
+      <div id="fc-mid" hidden><div id="fc-canvas"></div></div>
+      <div class="ss-stage" id="ss-mid-pro">
+        <div class="ss-device">
+          <div class="ss-frame">
+            <div class="ph">
+              <canvas class="ph-decor"></canvas>
+              <div class="ph-status"></div>
+              <div class="ph-top"></div>
+              <div class="ph-content"></div>
+              <div class="ph-nav"></div>
+              <!--
+                ★★ 源码渲染层（⌨ 切换）：盖在 .ph 上的 iframe，里面跑的**不是**这一页的
+                DOM 复刻，而是手机端 `android/shared-ui` 编译出来的 WasmJS —— 同一份
+                Compose 源码。于是"画布和真机不一样"在结构上不可能。
+
+                ⚠️ 这一层是**只读预览**：它盖住可编辑的 DOM 画布，所以拖拽/点选在这一层
+                   不做（想编辑就关掉 ⌨）。这样划清边界，比"两层都能点、都点半天"清楚。
+              -->
+              <div class="ss-srcwrap" id="ss-srcwrap" hidden>
+                <iframe id="ss-srcframe" title="源码渲染（与手机端同一份 Compose 源码）"></iframe>
+                <div class="ss-srcbadge">源码渲染 · 只读 · 关掉 ⌨ 回到可编辑画布</div>
+              </div>
+            </div>
+          </div>
+          <div class="ss-device-label" id="ss-devlabel">393×852</div>
+        </div>
+      </div>
+    </main>
+
+    <!-- ===== 右：自由=元素属性 ｜ 高级=检查器 ===== -->
+    <aside class="ss-right">
+      <div id="fc-right" hidden>
+        <div class="ss-colhead">属性 <span class="ss-colhead-sub" id="fc-insp-sub">未选中元素</span></div>
+        <div id="fc-inspector"></div>
+      </div>
+      <div id="ss-right-pro">
+        <div class="ss-colhead">属性 <span class="ss-colhead-sub" id="ss-insp-sub">未选中对象</span></div>
+        <div id="ss-inspector"></div>
+      </div>
+    </aside>
+
+  </div>
+</div>
+
+<!-- 发布模态（打包 / 体检 / 导出 / 发布 / 授权码都在这里） -->
+<div class="ss-modal" id="ss-modal" hidden>
+  <div class="ss-modal-mask" id="ss-modal-mask"></div>
+  <div class="ss-modal-box">
+    <div class="ss-modal-h">
+      <b>打包 · 发布 · 授权</b>
+      <button class="ss-icobtn" id="ss-modal-close" title="关闭（Esc）">✕</button>
+    </div>
+    <div class="ss-modal-b" id="ss-panel-pack"></div>
+  </div>
+</div>
+
+<!-- 代码模式（自由画布 → 看/改编译出来的 HTML） -->
+<div class="ss-modal" id="fc-code" hidden>
+  <div class="ss-modal-mask" id="fc-code-mask"></div>
+  <div class="ss-modal-box fc-codebox">
+    <div class="ss-modal-h">
+      <b>这一页编译出来的 HTML</b>
+      <span class="ss-colhead-sub" id="fc-code-sub"></span>
+      <button class="ss-icobtn" id="fc-code-close" title="关闭（Esc）">✕</button>
+    </div>
+    <div class="ss-modal-b">
+      <textarea id="fc-code-ta" spellcheck="false"></textarea>
+      <div class="fc-codenote" id="fc-code-note"></div>
+      <div class="fc-codeacts">
+        <button class="ss-pubbtn" id="fc-code-apply">用这段代码</button>
+        <button class="ss-icobtn" id="fc-code-reset">改回画布</button>
+        <span style="flex:1"></span>
+        <span class="ss-colhead-sub">「用这段代码」之后，画布由代码接管 —— 想再拖，点「改回画布」。</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="ss-toasts" id="ss-toasts"></div>
+
+<script src="skin-core.js"></script>
+<script src="free-canvas.js"></script>
+<script src="studio.js"></script>
+</body>
+</html>
