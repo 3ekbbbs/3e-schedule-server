@@ -1,0 +1,418 @@
+package app
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/teambition/rrule-go"
+)
+
+// The server is the ONLY place a recurrence rule is expanded. Clients never
+// link an RRULE library, which structurally removes the "Go / Kotlin / JS
+// libraries disagree on BYSETPOS or leap years" class of bug.
+const (
+	instanceWindowPastSec   = 7 * 86400
+	instanceWindowFutureSec = 90 * 86400
+
+	// instanceMaxCount 是**单条日程**在这个窗口里最多允许展开多少条。
+	//
+	// ⚠️ 2026-10-16 加（第三轮审计 H1）。服务端是**唯一**展开 RRULE 的地方
+	//    （上面那段注释：客户端不引 rrule 库，这是刻意的架构决策，本身正确），
+	//    但展开结果原来**没有任何上限**：`FREQ=SECONDLY` 在 97 天窗口里要迭代
+	//    **838 万次**，先全量物化进内存，再生成同量 instances + sync_log 行，
+	//    全部塞在**同一个事务**里。连接池只有几条连接，长事务期间整个服务端停摆 ——
+	//    而输入只有几百个字符，任意有日历写权限的用户都能做到，不需要越权。
+	//
+	//    取 2000：正常日程（每天/每周/每月）在这个窗口里最多几百条；
+	//    连"每小时一次"（2328 条）都只会被拒得稍早一点 —— 那本来就该换个表达。
+	instanceMaxCount = 2000
+)
+
+// allowedFreqs 是允许出现的重复频率。
+//
+// ⚠️ 2026-10-16 加。**不接受 SECONDLY / MINUTELY**：它们在 97 天窗口里分别能
+//    展开 838 万 / 14 万条，而"日程"这个场景下没有任何正当用途。
+//    挡在**展开之前**是关键 —— 等 `set.Between()` 返回再判长度，内存已经吃掉了。
+//    这是第一道闸，`instanceMaxCount` 那道兜住剩下的组合（比如 FREQ=HOURLY
+//    再叠 BYSECOND 仍然可能超出）。
+var allowedFreqs = map[rrule.Frequency]bool{
+	rrule.HOURLY:  true,
+	rrule.DAILY:   true,
+	rrule.WEEKLY:  true,
+	rrule.MONTHLY: true,
+	rrule.YEARLY:  true,
+}
+
+func locOf(tzid string) *time.Location {
+	if strings.TrimSpace(tzid) == "" {
+		tzid = "Asia/Shanghai"
+	}
+	l, err := time.LoadLocation(tzid)
+	if err != nil {
+		return time.UTC
+	}
+	return l
+}
+
+// occurrenceKeys expands an event into UTC unix seconds inside [from, to].
+// A non-recurring event yields at most one key.
+func occurrenceKeys(dtstartUTC int64, tzid, rr string, rdates, exdates []int64, from, to time.Time) ([]int64, error) {
+	loc := locOf(tzid)
+	rr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rr), "RRULE:"))
+
+	if rr == "" {
+		if dtstartUTC == 0 {
+			return nil, nil
+		}
+		t := time.Unix(dtstartUTC, 0)
+		if t.Before(from) || t.After(to) {
+			return nil, nil
+		}
+		return []int64{dtstartUTC}, nil
+	}
+
+	start := time.Unix(dtstartUTC, 0).In(loc)
+	opt, err := rrule.StrToROptionInLocation(rr, loc)
+	if err != nil {
+		return nil, err
+	}
+	// 第一道闸：频率白名单（在展开**之前**判，见 allowedFreqs 的注释）
+	if !allowedFreqs[opt.Freq] {
+		return nil, fmt.Errorf("不支持的重复频率 %s（支持按小时/天/周/月/年重复）", opt.Freq.String())
+	}
+	opt.Dtstart = start
+	rule, err := rrule.NewRRule(*opt)
+	if err != nil {
+		return nil, err
+	}
+
+	set := &rrule.Set{}
+	set.DTStart(start)
+	set.RRule(rule)
+	for _, k := range rdates {
+		set.RDate(time.Unix(k, 0).In(loc))
+	}
+	for _, k := range exdates {
+		set.ExDate(time.Unix(k, 0).In(loc))
+	}
+
+	res := set.Between(from.In(loc), to.In(loc), true)
+	// 第二道闸：条数兜底。频率白名单挡不住"合法频率 + 密集 BY* 组合"
+	// （例如 FREQ=HOURLY;BYSECOND=0,1,2,…,59），这里兜住。
+	// ⚠️ 到这个位置内存已经吃过了 —— 但被白名单限制过之后，最坏情况是十几万条
+	//    （几 MB），不是致命的几百万条。两道闸缺一不可。
+	if len(res) > instanceMaxCount {
+		return nil, fmt.Errorf(
+			"这条重复规则在这个时间范围里会展开出 %d 条（上限 %d）—— 把重复频率调疏一点再试",
+			len(res), instanceMaxCount)
+	}
+	out := make([]int64, 0, len(res))
+	seen := make(map[int64]bool, len(res))
+	for _, t := range res {
+		u := t.Unix()
+		if !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
+// nextOccurrenceAfter returns the first occurrence strictly after t, used to
+// tell "the series has ended" apart from "the window just ran out".
+func nextOccurrenceAfter(dtstartUTC int64, tzid, rr string, rdates, exdates []int64, after time.Time) (int64, bool, error) {
+	loc := locOf(tzid)
+	rr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rr), "RRULE:"))
+	if rr == "" {
+		if dtstartUTC > after.Unix() {
+			return dtstartUTC, true, nil
+		}
+		return 0, false, nil
+	}
+	start := time.Unix(dtstartUTC, 0).In(loc)
+	opt, err := rrule.StrToROptionInLocation(rr, loc)
+	if err != nil {
+		return 0, false, err
+	}
+	opt.Dtstart = start
+	rule, err := rrule.NewRRule(*opt)
+	if err != nil {
+		return 0, false, err
+	}
+	set := &rrule.Set{}
+	set.DTStart(start)
+	set.RRule(rule)
+	for _, k := range rdates {
+		set.RDate(time.Unix(k, 0).In(loc))
+	}
+	for _, k := range exdates {
+		set.ExDate(time.Unix(k, 0).In(loc))
+	}
+	nxt := set.After(after.In(loc), false)
+	if nxt.IsZero() {
+		return 0, false, nil
+	}
+	return nxt.Unix(), true, nil
+}
+
+type overridePatch struct {
+	Title       *string `json:"title,omitempty"`
+	Notes       *string `json:"notes,omitempty"`
+	Location    *string `json:"location,omitempty"`
+	AllDay      *bool   `json:"all_day,omitempty"`
+	DTStartUTC  *int64  `json:"dtstart_utc,omitempty"`
+	DurationSec *int64  `json:"duration_sec,omitempty"`
+	DoneAt      *int64  `json:"done_at,omitempty"`
+}
+
+func (p overridePatch) apply(title, notes, location string, allDay bool, startUTC, dur int64, doneAt *int64) (string, string, string, bool, int64, int64, *int64) {
+	if p.Title != nil {
+		title = *p.Title
+	}
+	if p.Notes != nil {
+		notes = *p.Notes
+	}
+	if p.Location != nil {
+		location = *p.Location
+	}
+	if p.AllDay != nil {
+		allDay = *p.AllDay
+	}
+	if p.DTStartUTC != nil {
+		startUTC = *p.DTStartUTC
+	}
+	if p.DurationSec != nil {
+		dur = *p.DurationSec
+	}
+	if p.DoneAt != nil {
+		doneAt = p.DoneAt
+	}
+	return title, notes, location, allDay, startUTC, dur, doneAt
+}
+
+// recomputeInstances rebuilds the instance window for one event, allocating a
+// new seq only for rows whose content actually changed. Without that diff a
+// single 90-day daily event would burn 90 sync_log rows on every keystroke.
+func recomputeInstances(tx *sql.Tx, eventID string, now time.Time) error {
+	var (
+		calID, tzid            string
+		title, notes, location string
+		allDay, isTask         int64
+		dtstart                sql.NullInt64
+		dur                    int64
+		rr                     sql.NullString
+		rdateS, exdateS        string
+		deleted                sql.NullInt64
+		doneAt                 sql.NullInt64
+	)
+	// is_task is in this list on purpose, and it used to be missing. The scan
+	// targets below always had a slot for it, so leaving it out of the SELECT
+	// did not fail — it just left isTask at 0 forever, which meant every
+	// instance of a task reached the clients as an ordinary entry with no
+	// checkbox. Nothing else writes the instances table, so this single
+	// omission disabled the whole 待办 feature on every client.
+	err := tx.QueryRow(`
+		SELECT calendar_id, tzid, title, notes, location, all_day, is_task, dtstart_utc,
+		       duration_sec, rrule, rdate, exdate, deleted_at, done_at
+		FROM events WHERE id=?`, eventID).Scan(
+		&calID, &tzid, &title, &notes, &location, &allDay, &isTask, &dtstart,
+		&dur, &rr, &rdateS, &exdateS, &deleted, &doneAt)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	// --- collect the desired instance set -------------------------------
+	desired := map[int64]*Instance{}
+
+	gone := deleted.Valid || !dtstart.Valid || dtstart.Int64 == 0
+	if !gone {
+		from := now.Add(-instanceWindowPastSec * time.Second)
+		to := now.Add(instanceWindowFutureSec * time.Second)
+
+		var rdates, exdates []int64
+		_ = json.Unmarshal([]byte(rdateS), &rdates)
+		_ = json.Unmarshal([]byte(exdateS), &exdates)
+
+		keys, expErr := occurrenceKeys(dtstart.Int64, tzid, rr.String, rdates, exdates, from, to)
+		if expErr != nil {
+			// A malformed rule must not take the whole sync down: fall back to
+			// treating the event as single-shot so the user still sees it.
+			keys = []int64{dtstart.Int64}
+		}
+
+		// overrides replace or cancel individual occurrences
+		ovr := map[int64]overridePatch{}
+		cancelled := map[int64]bool{}
+		rows, qErr := tx.Query(`SELECT occurrence_key, patch, cancelled FROM event_overrides WHERE event_id=?`, eventID)
+		if qErr == nil {
+			for rows.Next() {
+				var k int64
+				var patchS string
+				var canc int64
+				if err := rows.Scan(&k, &patchS, &canc); err == nil {
+					if canc != 0 {
+						cancelled[k] = true
+					}
+					var p overridePatch
+					if json.Unmarshal([]byte(patchS), &p) == nil {
+						ovr[k] = p
+					}
+				}
+			}
+			rows.Close()
+		}
+
+		var donePtr *int64
+		if doneAt.Valid {
+			v := doneAt.Int64
+			donePtr = &v
+		}
+
+		for _, k := range keys {
+			if cancelled[k] {
+				continue
+			}
+			iTitle, iNotes, iLoc, iAllDay, iStart, iDur, iDone :=
+				title, notes, location, allDay != 0, k, dur, donePtr
+			isOvr := false
+			if p, ok := ovr[k]; ok {
+				iTitle, iNotes, iLoc, iAllDay, iStart, iDur, iDone =
+					p.apply(title, notes, location, allDay != 0, k, dur, donePtr)
+				isOvr = true
+			}
+			if iDur < 0 {
+				iDur = 0
+			}
+			desired[k] = &Instance{
+				ID:            eventID + ":" + itoa(k),
+				EventID:       eventID,
+				OccurrenceKey: k,
+				CalendarID:    calID,
+				StartUTC:      iStart,
+				EndUTC:        iStart + iDur,
+				AllDay:        iAllDay,
+				Title:         iTitle,
+				Notes:         iNotes,
+				Location:      iLoc,
+				IsTask:        isTask != 0,
+				DoneAt:        iDone,
+				IsOverride:    isOvr,
+			}
+		}
+	}
+
+	// --- current rows ---------------------------------------------------
+	//
+	// ★ 2026-09-28：这里必须把 calendar_id 一起读出来、一起比、一起写。
+	//
+	// 换日历只改 events 一行，instances 是**派生**的 —— 但"派生"不等于
+	// "会自动跟着变"：实例的重算靠下面那个 `same` 判定短路，而它原本只比
+	// 时间/标题/地点。于是"只换了日历、别的都没动"恰好落进 same==true
+	// 那一支 → 直接 continue → 实例永远留在**旧日历**上。
+	//
+	// 症状很隐蔽：日程行挪过去了，日程的实例没挪 —— 客户端按日历过滤实例，
+	// 结果就是"换完之后在哪儿都看着别扭"（旧日历里冒出来、新日历里没有）。
+	// 就算侥幸走了 upsert 分支，原来的 ON CONFLICT 也没更新 calendar_id，
+	// 一样是旧值。
+	type curRow struct {
+		calID                  string
+		start, end             int64
+		allDay, isTask, isOvr  int64
+		title, notes, location string
+		doneAt                 sql.NullInt64
+		deleted                sql.NullInt64
+	}
+	cur := map[int64]curRow{}
+	rows, err := tx.Query(`SELECT occurrence_key, calendar_id, start_utc, end_utc, all_day, title, notes,
+		location, is_task, done_at, is_override, deleted_at FROM instances WHERE event_id=?`, eventID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var k int64
+		var r curRow
+		if err := rows.Scan(&k, &r.calID, &r.start, &r.end, &r.allDay, &r.title, &r.notes,
+			&r.location, &r.isTask, &r.doneAt, &r.isOvr, &r.deleted); err == nil {
+			cur[k] = r
+		}
+	}
+	rows.Close()
+
+	deletedNow := now.Unix()
+
+	// --- upsert changed / new -------------------------------------------
+	for k, want := range desired {
+		if r, ok := cur[k]; ok && !r.deleted.Valid {
+			same := r.calID == want.CalendarID &&
+				r.start == want.StartUTC && r.end == want.EndUTC &&
+				r.allDay == boolToInt(want.AllDay) && r.title == want.Title &&
+				r.notes == want.Notes && r.location == want.Location &&
+				r.isTask == boolToInt(want.IsTask) && r.isOvr == boolToInt(want.IsOverride) &&
+				nullEq(r.doneAt, want.DoneAt)
+			if same {
+				continue
+			}
+		}
+		seq, err := nextSeq(tx, "instance", want.ID, "upsert")
+		if err != nil {
+			return err
+		}
+		want.Seq = seq
+		if _, err := tx.Exec(`
+			INSERT INTO instances(id,event_id,occurrence_key,calendar_id,start_utc,end_utc,all_day,
+				title,notes,location,is_task,done_at,is_override,seq,deleted_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+			ON CONFLICT(id) DO UPDATE SET
+				calendar_id=excluded.calendar_id,
+				start_utc=excluded.start_utc, end_utc=excluded.end_utc, all_day=excluded.all_day,
+				title=excluded.title, notes=excluded.notes, location=excluded.location,
+				is_task=excluded.is_task, done_at=excluded.done_at,
+				is_override=excluded.is_override, seq=excluded.seq, deleted_at=NULL`,
+			want.ID, want.EventID, want.OccurrenceKey, want.CalendarID, want.StartUTC, want.EndUTC,
+			boolToInt(want.AllDay), want.Title, want.Notes, want.Location,
+			boolToInt(want.IsTask), want.DoneAt, boolToInt(want.IsOverride), seq); err != nil {
+			return err
+		}
+	}
+
+	// --- tombstone rows that no longer exist ----------------------------
+	for k, r := range cur {
+		if r.deleted.Valid {
+			continue
+		}
+		if _, ok := desired[k]; ok {
+			continue
+		}
+		seq, err := nextSeq(tx, "instance", idOf(eventID, k), "delete")
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE instances SET deleted_at=?, seq=? WHERE event_id=? AND occurrence_key=?`,
+			deletedNow, seq, eventID, k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func idOf(eventID string, k int64) string { return eventID + ":" + itoa(k) }
+
+func nullEq(a sql.NullInt64, b *int64) bool {
+	if !a.Valid {
+		return b == nil
+	}
+	return b != nil && a.Int64 == *b
+}
+
+func boolToInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}

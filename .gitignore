@@ -1,0 +1,19 @@
+# 运行时数据
+data/
+certs/
+dist/
+tmp-test/
+*.exe
+*.dll
+*.log
+
+# 本机配置与令牌
+config.json
+deploy-token.txt
+startup-error.log
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store

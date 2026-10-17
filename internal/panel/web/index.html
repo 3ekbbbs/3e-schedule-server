@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>日程服务端 · 管理面板</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-home" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.8V21h14V9.8"/><path d="M9.5 21v-6h5v6"/>
+  </symbol>
+  <symbol id="i-server" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/>
+    <path d="M7 7.5h.01M7 16.5h.01"/>
+  </symbol>
+  <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.2 2.7-5.2 6-5.2s6 2 6 5.2"/>
+    <path d="M16 5.2a3 3 0 0 1 0 5.6"/><path d="M18.5 14.6c1.8.7 2.9 2.1 2.9 4"/>
+  </symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3 5 6v6c0 4.2 2.9 7.6 7 9 4.1-1.4 7-4.8 7-9V6l-7-3Z"/>
+    <path d="m9 12 2 2 4-4"/>
+  </symbol>
+  <symbol id="i-box" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="m4 7.5 8 4.5 8-4.5"/><path d="M12 12v9"/>
+  </symbol>
+  <symbol id="i-tools" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14.5 4.5a4.2 4.2 0 0 0-5.7 5.7L4 15v5h5l4.8-4.8a4.2 4.2 0 0 0 5.7-5.7l-2.8 2.8-2.5-2.5 2.8-2.8Z"/>
+  </symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="3"/>
+    <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21h-4v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3.1 14H3v-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5V3h4v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.1v4h-.1a1.7 1.7 0 0 0-1.5 1Z"/>
+  </symbol>
+</svg>
+
+<div id="login" class="login-wrap" hidden></div>
+
+<div id="app" class="shell" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">S</div>
+      <div>
+        <h1>日程服务端</h1>
+        <p>本地管理面板</p>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#/overview" data-page="overview"><svg class="ico"><use href="#i-home"/></svg>概览</a>
+      <a href="#/server" data-page="server"><svg class="ico"><use href="#i-server"/></svg>服务</a>
+      <a href="#/accounts" data-page="accounts"><svg class="ico"><use href="#i-users"/></svg>账号</a>
+      <a href="#/moderation" data-page="moderation"><svg class="ico"><use href="#i-shield"/></svg>内容审核</a>
+      <a href="#/distribution" data-page="distribution"><svg class="ico"><use href="#i-box"/></svg>分发</a>
+      <a href="#/maintenance" data-page="maintenance"><svg class="ico"><use href="#i-tools"/></svg>维护</a>
+      <a href="#/settings" data-page="settings"><svg class="ico"><use href="#i-settings"/></svg>设置</a>
+    </nav>
+    <div class="sidebar-foot" id="sideFoot"></div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h2 id="pageTitle">概览</h2>
+      <span id="topStatus" class="badge neutral">加载中</span>
+      <span class="who" id="who"></span>
+      <button class="btn sm" id="btnLogout">退出登录</button>
+    </header>
+    <div class="content" id="view"></div>
+  </main>
+</div>
+
+<div class="toast-host" id="toasts"></div>
+<div id="modalHost"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

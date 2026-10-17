@@ -1,0 +1,389 @@
+package app
+
+import (
+	"database/sql"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// loadMembers returns a calendar's member list.
+//
+// `role` 是 SQL 里的真列名，不是 Go 关键字 —— 但 SELECT 列表里少写一个字段
+// 会让后面的 Scan 静默错位（值照样塞进去、类型不对就跳过），历史上出过一次。
+// 所以列名和 Scan 目标严格按同一顺序排，别插队。
+func (s *Server) loadMembers(calendarID string) []Member {
+	rows, err := s.db.sql.Query(`
+		SELECT cm.user_id, COALESCE(u.name,''), cm.role
+		FROM calendar_members cm LEFT JOIN users u ON u.id = cm.user_id
+		WHERE cm.calendar_id=? ORDER BY cm.role, u.name`, calendarID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := []Member{}
+	for rows.Next() {
+		var m Member
+		if err := rows.Scan(&m.UserID, &m.Name, &m.Role); err == nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (s *Server) calendarByID(id, uid string) (*Calendar, bool) {
+	var c Calendar
+	var deleted sql.NullInt64
+	var fs string
+	var ownerName sql.NullString
+	err := s.db.sql.QueryRow(`
+		SELECT c.id,c.owner_id,c.name,c.color,c.kind,c.seq,c.field_seqs,c.updated_at,c.created_at,c.deleted_at,
+		       COALESCE(u.name,'')
+		FROM calendars c LEFT JOIN users u ON u.id=c.owner_id WHERE c.id=?`, id).
+		Scan(&c.ID, &c.OwnerID, &c.Name, &c.Color, &c.Kind, &c.Seq, &fs, &c.UpdatedAt, &c.CreatedAt, &deleted, &ownerName)
+	if err != nil {
+		return nil, false
+	}
+	if deleted.Valid {
+		c.DeletedAt = &deleted.Int64
+	}
+	c.FieldSeqs = decodeFieldSeqs(fs)
+	c.OwnerName = ownerName.String
+	role, ok := s.calendarRole(id, uid)
+	if !ok {
+		return nil, false
+	}
+	c.Role = role
+	c.Members = s.loadMembers(id)
+	return &c, true
+}
+
+// handleListCalendars returns every calendar the caller can see.
+// calendarsFor returns every calendar the user can see: the ones they own plus
+// the ones they are a member of.
+// calendarsFor 列出某个人能看到的**所有**日历。
+//
+// ⚠️⚠️ **这个查询是可见性的第二个收口点，不是"按 id 查一下"那么简单。**
+//
+// 原来这里只判 owner + calendar_members。2026-09-21 加团队时，
+// 我以为 `calendarRole` 是唯一收口点（canRead/canWrite 都走它）——
+// **这个假设在"列表"这类接口上不成立**：列表是"先查 id 再逐个取"，
+// 它自己就写了一遍可见性条件。
+//
+// 结果：团队共享出去的日历，成员在 `GET /api/calendars` 里**完全看不到**
+// （列表空），但按 id 访问却是通的 —— 表现是"团队里的人说没收到那张日历"。
+// `scripts/team-check.mjs` 的"通过团队看到那张日历"一条直接抓到了它。
+//
+// 所以以后**任何**按人筛日历的地方，都要同时考虑这三条路径：
+//
+//	① 我是 owner
+//	② 我在 calendar_members 里
+//	③ 我在 calendar_teams 关联的某个团队里（团队共享）
+//
+// 少一条就会出现"能访问但列表里没有"这种半通状态。
+// ★★ 2026-09-25 补了一个漏了两年的过滤条件：`c.deleted_at IS NULL`。
+//
+// 删日历走的是**软删**（`handleDeleteCalendar` 只 `UPDATE calendars SET deleted_at=...`
+// 并抬 seq，好让 tombstone 能同步给各端）。但**这里没有把软删的排除掉** ——
+// 于是 `GET /api/calendars`（和 `GET /api/ext/calendars`）**照样把删掉的日历列出来**。
+//
+// 用户的原话正是这个：「有些日历明明删掉了，但它还在列表里面，再点击删除提示不存在」 ——
+// 列表里有它（所以能点删除），真去删又 404（因为 `calendarRole` 那边看不到软删的），
+// 于是就卡成"删不掉、也消不掉"。
+//
+// ⚠️ 各端**本地镜像**那层也有 `!c.deleted_at` 过滤（电脑端 `store.calendars()`），
+//
+//	所以以前只是"某些路径看不到" —— 但**服务端自己不筛就是错的**：
+//	外置 API 直接读它，第三方 AI 会看到一堆幽灵日历。
+//
+// ⚠️ 加条件时括号不能少：`A IS NULL AND (B OR C OR D)`，
+//
+//	写成 `A IS NULL AND B OR C OR D` 的话后两个 OR 会绕过整个条件。
+func (s *Server) calendarsFor(uid string) ([]Calendar, error) {
+	rows, err := s.db.sql.Query(`
+		SELECT c.id FROM calendars c
+		WHERE c.deleted_at IS NULL
+		  AND (c.owner_id = ?
+		       OR EXISTS(SELECT 1 FROM calendar_members m WHERE m.calendar_id=c.id AND m.user_id=?)
+		       OR EXISTS(SELECT 1 FROM calendar_teams ct
+		                  JOIN team_members tm ON tm.team_id = ct.team_id
+		                  WHERE ct.calendar_id=c.id AND tm.user_id=?))
+		ORDER BY c.created_at`, uid, uid, uid)
+	if err != nil {
+		return nil, err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+
+	out := []Calendar{}
+	for _, id := range ids {
+		if c, ok := s.calendarByID(id, uid); ok {
+			out = append(out, *c)
+		}
+	}
+	return out, nil
+}
+
+func (s *Server) handleListCalendars(w http.ResponseWriter, r *http.Request) {
+	uid := userIDOf(r)
+	out, err := s.calendarsFor(uid)
+	if err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"calendars": out})
+}
+
+type calendarReq struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Color     string   `json:"color"`
+	Kind      string   `json:"kind"`
+	MemberIDs []string `json:"member_ids"`
+	BaseSeqs  jsonMap  `json:"field_base_seqs"`
+	DeviceID  string   `json:"device_id"`
+}
+
+func (s *Server) handleCreateCalendar(w http.ResponseWriter, r *http.Request) {
+	uid := userIDOf(r)
+	var req calendarReq
+	if err := readJSON(r, &req); err != nil {
+		apiErr(w, 400, "bad json")
+		return
+	}
+	req.Name = trimSpace(req.Name)
+	if req.Name == "" {
+		apiErr(w, 400, "日历名称不能为空")
+		return
+	}
+	// 违禁词闸门：日历名是会出现在别人共享列表里的，必须过一遍
+	if s.blockedByWords(w, r, map[string]string{"日历名称": req.Name}) {
+		return
+	}
+	if req.Color == "" {
+		req.Color = "#378ADD"
+	}
+	kind := req.Kind
+	// "course" marks a timetable calendar: the same events, rendered as a
+	// periods x weekdays grid instead of an agenda.
+	if kind != "shared" && kind != "course" {
+		kind = "private"
+	}
+
+	tx, err := s.db.sql.Begin()
+	if err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	id := newID("c_")
+	now := time.Now().Unix()
+	fs := jsonMap{}
+	seq, err := nextSeq(tx, "calendar", id, "create")
+	if err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	for _, f := range []string{"name", "color", "kind"} {
+		fs[f] = seq
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO calendars(id,owner_id,name,color,kind,seq,field_seqs,updated_at,updated_by_device,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		id, uid, req.Name, req.Color, kind, seq, encodeFieldSeqs(fs), now, req.DeviceID, now); err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	// the owner is always a member so the permission query has one code path
+	if _, err := tx.Exec(`INSERT INTO calendar_members(calendar_id,user_id,role) VALUES(?,?,?)`,
+		id, uid, "owner"); err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	// ⚠️ 去重 + 不许吞错（2026-10-16 修）。
+	//
+	// 原来这里是 `_, _ = tx.Exec(...)`：插入失败一声不吭，而响应照样是 200 + 日历，
+	// 用户看到的是「已共享」。`calendar_members` 的主键是 (calendar_id, user_id)，
+	// 所以唯一的现实失败是**同一个 mid 出现两次** —— 那种情况本来也只需要一条，
+	// 于是这里先自己按 uid 去重，再把真错误报出去。
+	// （服务端 `foreign_keys(0)`，所以不存在的 uid 不会在这里报错，这一点没变。）
+	seenMember := map[string]bool{uid: true}
+	for _, mid := range req.MemberIDs {
+		if mid == "" || seenMember[mid] {
+			continue
+		}
+		seenMember[mid] = true
+		if _, err := tx.Exec(`INSERT INTO calendar_members(calendar_id,user_id,role) VALUES(?,?,?)`,
+			id, mid, "editor"); err != nil {
+			apiErr(w, 500, err.Error())
+			return
+		}
+	}
+	// 新成员要能看到这张日历**里面已有的东西**，否则他只会看到一个空日历
+	// （建日历那一刻通常还没有日程，这一步是为"先有日程、后来才共享"准备的）
+	if err := s.resendCalendarContents(tx, id); err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	c, _ := s.calendarByID(id, uid)
+	writeJSON(w, 200, map[string]any{"calendar": c})
+}
+
+func (s *Server) handleUpdateCalendar(w http.ResponseWriter, r *http.Request) {
+	uid := userIDOf(r)
+	id := r.PathValue("id")
+	if _, ok := s.calendarRole(id, uid); !ok {
+		apiErr(w, 404, "日历不存在或无权访问")
+		return
+	}
+	if !s.canWrite(id, uid) {
+		apiErr(w, 403, "这个日历你没有编辑权限")
+		return
+	}
+	var req calendarReq
+	if err := readJSON(r, &req); err != nil {
+		apiErr(w, 400, "bad json")
+		return
+	}
+	// 违禁词闸门：只在**本次真的改了名字**时检查。
+	//
+	// 不传 name 表示"不改名"，此时若拿旧名字去查会**误伤** —— 旧名可能是
+	// 词库建立之前就存在的历史数据，用户这次只想改个颜色，却被拦下来说
+	// "名字违规"。所以判据必须是"这次要写入什么"，不是"这条数据长什么样"。
+	if strings.TrimSpace(req.Name) != "" {
+		if s.blockedByWords(w, r, map[string]string{"日历名称": req.Name}) {
+			return
+		}
+	}
+
+	tx, err := s.db.sql.Begin()
+	if err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	incoming := jsonMap{}
+	if req.Name != "" {
+		incoming["name"] = req.Name
+	}
+	if req.Color != "" {
+		incoming["color"] = req.Color
+	}
+	if req.Kind != "" {
+		incoming["kind"] = req.Kind
+	}
+
+	res, err := applyFieldMerge(tx, "calendar", id, incoming, req.BaseSeqs, req.DeviceID)
+	if err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	c, _ := s.calendarByID(id, uid)
+	writeJSON(w, 200, map[string]any{"calendar": c, "conflicts": res.Conflicts})
+}
+
+func (s *Server) handleDeleteCalendar(w http.ResponseWriter, r *http.Request) {
+	uid := userIDOf(r)
+	id := r.PathValue("id")
+	role, ok := s.calendarRole(id, uid)
+	if !ok {
+		apiErr(w, 404, "日历不存在")
+		return
+	}
+	if role != "owner" {
+		apiErr(w, 403, "只有日历创建者能删除")
+		return
+	}
+	tx, err := s.db.sql.Begin()
+	if err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	// ⚠️ nextSeq 的错误**必须**接住（2026-10-16 修）。
+	//
+	// 它做的事是往 `sync_log` 插一行、返回那个自增 id 当 seq——**客户端只拉
+	// `seq > 自己游标` 的东西**（`collectChanges` 的 `WHERE seq > ?`）。
+	// 而 `sync_log.seq` 是 `INTEGER PRIMARY KEY AUTOINCREMENT`，**最小是 1**。
+	//
+	// 所以这里一旦吞掉错误：seq 保持 0 → 墓碑带着 `seq=0` 落库 →
+	// `sync_log` 里**根本没有这一条** → **除了点删除的那台设备，谁的日历都不会消失**，
+	// 而且永远不会消失（游标只会往前）。
+	//
+	// 全仓 36 个 nextSeq 调用点里有 6 个是这么吞掉的，都是同一个坏法；已一起修。
+	seq, err := nextSeq(tx, "calendar", id, "delete")
+	if err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	if _, err := tx.Exec(`UPDATE calendars SET deleted_at=?, seq=?, updated_at=? WHERE id=?`, now, seq, now, id); err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	// cascade the tombstone to events and their instances
+	//
+	// ⚠️ 查询失败也必须返回（2026-10-16 修）：吞掉它 → evIDs 空 → 日历删了、
+	//    里面日程一条没删，而客户端那边这些日程会一直显示（只收到日历的墓碑）。
+	rows, err := tx.Query(`SELECT id FROM events WHERE calendar_id=? AND deleted_at IS NULL`, id)
+	if err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	evIDs := []string{}
+	for rows.Next() {
+		var eid string
+		if err := rows.Scan(&eid); err == nil {
+			evIDs = append(evIDs, eid)
+		}
+	}
+	rows.Close()
+	for _, eid := range evIDs {
+		eseq, err := nextSeq(tx, "event", eid, "delete")
+		if err != nil {
+			apiErr(w, 500, err.Error())
+			return
+		}
+		if _, err := tx.Exec(`UPDATE events SET deleted_at=?, seq=?, updated_at=? WHERE id=?`, now, eseq, now, eid); err != nil {
+			apiErr(w, 500, err.Error())
+			return
+		}
+		if err := recomputeInstances(tx, eid, time.Now()); err != nil {
+			apiErr(w, 500, err.Error())
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		apiErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func trimSpace(s string) string {
+	i, j := 0, len(s)
+	for i < j && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+	for j > i && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\n' || s[j-1] == '\r') {
+		j--
+	}
+	return s[i:j]
+}

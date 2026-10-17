@@ -1,0 +1,22 @@
+{
+  "addr": ":8443",
+  "http_addr": "",
+  "wordbook_addr": "",
+  "internal_addr": "127.0.0.1:0",
+  "cert_dir": "certs",
+  "data_dir": "data",
+  "server_name": "",
+  "auto_cert": true,
+  "invite_code": "",
+  "weather_place": "北京市",
+  "weather_lat": 39.9042,
+  "weather_lon": 116.4074,
+  "weather_ua": "schedule-server (self-hosted)",
+  "live_secret": "",
+  "diag": false,
+  "cos_base": "",
+  "market_url": "",
+  "panel_listen": "127.0.0.1:9800",
+  "panel_auto_open": true,
+  "auto_restart": true
+}
