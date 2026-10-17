@@ -363,11 +363,14 @@ async function navigate() {
   const view = $('#view');
   view.innerHTML = '<div class="empty">加载中…</div>';
   try {
-    const html = await PAGES[page].render();
+    const mod = PAGES[page];
+    if (!mod) throw new Error('未知页面：' + page);
+    const html = await mod.render();
     view.innerHTML = html;
-    if (PAGES[page].mount) PAGES[page].mount();
+    if (mod.mount) mod.mount();
   } catch (e) {
-    view.innerHTML = `<div class="alert bad">${esc(e.message || String(e))}</div>`;
+    console.error('render failed', e);
+    view.innerHTML = `<div class="alert bad">页面加载失败：${esc(e.message || String(e))}</div>`;
   }
 }
 
