@@ -406,8 +406,11 @@ async function renderOverview() {
     ['封禁账号', admin ? admin.users_banned : '—'],
     ['自动重启', st.config && st.config.auto_restart ? '已开启' : '已关闭'],
   ];
+  const layout = st.data_layout || null;
+  const port = String((st.config && st.config.addr) || '').split(':').pop() || '8443';
 
   return `
+    ${layout && layout.in_program ? dataDirNotice(layout) : ''}
     <div class="grid cols-4">
       ${statCard('服务状态', running ? '运行中' : '已停止',
         running ? `PID ${st.server.pid} · ${fmtDuration(st.server.uptime)}` : '面板仍在运行，可随时启动',
@@ -416,6 +419,13 @@ async function renderOverview() {
       ${statCard('日历', esc(h.calendars != null ? h.calendars : '—'), '未删除的日历', '')}
       ${statCard('日程', esc(h.events != null ? h.events : '—'), '未删除的日程', '')}
     </div>
+
+    ${card('客户端连这里', `
+      <div id="connBox"><span class="muted">正在探测这台机器的地址…</span></div>
+      <div class="hint" style="margin-top:12px">
+        手机或电脑第一次连接时，把上面任意一条填进「服务器地址」。
+        同一个 WiFi 用内网地址；人在外面用公网地址，路由器上要把 ${esc(port)} 端口映射到这台机器。
+      </div>`, { sub: '填进客户端的「服务器地址」' })}
 
     <div class="grid cols-2" style="margin-top:16px">
       ${card('快捷操作', `
@@ -455,6 +465,47 @@ function listenSummary(c) {
   return parts.join(' · ') || '未配置';
 }
 
+// dataDirNotice 只在"数据还在程序目录里"时出现。
+// 这一条比页面上其他所有提示都重要：更新程序时被一起删掉的就是它。
+function dataDirNotice(lay) {
+  return `<div class="alert warn" style="margin-bottom:16px">
+    <div><b>数据目录在程序目录里。</b>更新程序时如果整个目录被替换，这里的数据会跟着没。</div>
+    <div class="mono small" style="margin-top:6px">${esc(lay.data_dir)}</div>
+    ${lay.can_move
+      ? `<button class="btn sm" data-act="relocate" style="margin-top:10px">搬到 ${esc(lay.target)}</button>
+         <div class="hint" style="margin-top:8px">搬过去之后原目录保留，确认新位置正常再自己清理。</div>`
+      : `<div class="small" style="margin-top:6px">${esc(lay.reason || '')}</div>`}
+  </div>`;
+}
+
+// connHTML 把探测到的地址排成三行：公网 / 内网 / 本机。
+function connHTML(d) {
+  if (!d) return '<span class="muted">没拿到地址</span>';
+  const row = (tag, url) => url
+    ? `<div class="conn-row"><span class="conn-tag">${tag}</span><code>${esc(url)}</code>` +
+      `<button class="btn sm" data-copy="${esc(url)}">复制</button></div>`
+    : '';
+  const pub = d.public_ok
+    ? row('公网', d.url_public)
+    : `<div class="conn-row"><span class="conn-tag">公网</span>` +
+      `<span class="muted">没探测到：${esc(d.public_error || '未知原因')}</span></div>`;
+  const lan = (d.url_lan || []).length
+    ? d.url_lan.map((u) => row('内网', u)).join('')
+    : `<div class="conn-row"><span class="conn-tag">内网</span>` +
+      `<span class="muted">这台机器没有内网地址</span></div>`;
+  return pub + lan + row('本机', d.url_local);
+}
+
+async function fillConn() {
+  const box = $('#connBox');
+  if (!box) return;
+  try {
+    box.innerHTML = connHTML(await sget('/api/admin/netinfo'));
+  } catch (e) {
+    box.innerHTML = '<span class="muted">服务没在运行，启动之后才能探测地址。</span>';
+  }
+}
+
 async function mountOverview() {
   const load = async () => {
     try {
@@ -467,12 +518,39 @@ async function mountOverview() {
   const r = $('#ovLogRefresh');
   if (r) r.onclick = load;
 
+  fillConn();
+
   $('#view').onclick = async (e) => {
+    const cp = e.target.closest('[data-copy]');
+    if (cp) {
+      try {
+        await navigator.clipboard.writeText(cp.dataset.copy);
+        toast('已复制', 'ok');
+      } catch (err) {
+        toast('复制失败，请手动选中', 'err');
+      }
+      return;
+    }
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     const act = btn.dataset.act;
     btn.disabled = true;
     try {
+      if (act === 'relocate') {
+        const lay = (S.state && S.state.data_layout) || {};
+        const ok = await confirmBox({
+          title: '把数据搬到程序目录外',
+          text: `数据会复制到 ${lay.target}，服务停一下再起来。原目录保留，不会被删。`,
+          detail: '复制完会核对账号、日程数量，对不上就退回原来的目录。',
+          ok: '开始搬',
+        });
+        if (!ok) { btn.disabled = false; return; }
+        btn.textContent = '搬运中…';
+        const d = await ppost('/data/relocate');
+        toast(`已搬到 ${d.to}，${d.files} 个文件`, 'ok');
+        await navigate();
+        return;
+      }
       if (act === 'start') { await ppost('/server/start'); toast('服务已启动', 'ok'); }
       if (act === 'stop') {
         if (!(await confirmBox({ title: '停止服务', text: '停止后所有客户端将无法同步，直到再次启动。', ok: '停止', danger: true }))) return;
@@ -545,8 +623,8 @@ async function renderServer() {
           <div class="field"><label>HTTP 监听</label><input type="text" name="http_addr" value="${esc(c.http_addr || '')}" placeholder=":8080（可选）"><span class="hint">生产环境建议留空，由反向代理终止 TLS</span></div>
           <div class="field"><label>背词同步监听</label><input type="text" name="wordbook_addr" value="${esc(c.wordbook_addr || '')}" placeholder=":8446（可选）"><span class="hint">不需要背词功能就留空</span></div>
           <div class="field"><label>内部管理地址</label><input type="text" name="internal_addr" value="${esc(c.internal_addr || '')}" placeholder="127.0.0.1:0"><span class="hint">仅供面板调用，保持回环即可</span></div>
-          <div class="field"><label>数据目录</label><input type="text" name="data_dir" value="${esc(c.data_dir || '')}"><span class="hint">相对路径以 exe 所在目录为基准</span></div>
-          <div class="field"><label>证书目录</label><input type="text" name="cert_dir" value="${esc(c.cert_dir || '')}"></div>
+          <div class="field"><label>数据目录</label><input type="text" name="data_dir" value="${esc(c.data_dir || '')}" placeholder="留空 = 程序目录之外"><span class="hint">留空时用 <span class="mono">${esc(st.panel.data_dir)}</span>。相对路径以 exe 所在目录为基准。</span></div>
+          <div class="field"><label>证书目录</label><input type="text" name="cert_dir" value="${esc(c.cert_dir || '')}" placeholder="留空 = 数据目录旁边"><span class="hint">留空时用 <span class="mono">${esc(st.panel.cert_dir)}</span></span></div>
           <div class="field"><label>证书域名</label><input type="text" name="server_name" value="${esc(c.server_name || '')}" placeholder="可选，例如 calendar.example.com"><span class="hint">自动生成证书时签进 SAN</span></div>
           <div class="field"><label>运行选项</label>
             <label class="check"><input type="checkbox" name="auto_cert" ${c.auto_cert ? 'checked' : ''}> 证书缺失时自动生成自签证书</label>

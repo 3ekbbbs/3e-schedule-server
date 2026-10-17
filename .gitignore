@@ -2,6 +2,7 @@
 data/
 certs/
 dist/
+build/
 tmp/
 tmp-test/
 *.exe

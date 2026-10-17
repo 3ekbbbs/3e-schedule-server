@@ -43,6 +43,10 @@ func (p *Panel) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/panel/backups", p.auth(p.handleBackups))
 	mux.HandleFunc("GET /api/panel/backup/download", p.auth(p.handleBackupDownload))
 	mux.HandleFunc("POST /api/panel/restore", p.write(p.handleRestore))
+
+	// 数据目录与程序目录分离。搬的时候先复制再改配置，原目录不删。
+	mux.HandleFunc("GET /api/panel/data/layout", p.auth(p.handleDataLayout))
+	mux.HandleFunc("POST /api/panel/data/relocate", p.write(p.handleDataRelocate))
 	mux.HandleFunc("GET /api/panel/deploy-token", p.auth(p.handleGetDeployToken))
 	mux.HandleFunc("POST /api/panel/deploy-token", p.write(p.handleNewDeployToken))
 
@@ -262,6 +266,8 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	if sess != nil {
 		resp["config"] = cfg
+		// 数据目录是不是还在程序目录里 —— 登录后才有意义，也只给登录后看。
+		resp["data_layout"] = p.dataLayoutNow()
 		// new map 而不是改原 map，避免登录态字段被后续写入影响。
 		resp["session"] = map[string]any{"loggedIn": true, "name": sess.Name}
 	}

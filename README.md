@@ -52,7 +52,7 @@
 
 ## 网络地址
 
-「服务」页有一个「探测地址」按钮。它会列出：
+概览页第一块是「客户端连这里」，列出这台机器能用的三条地址，每条都能一键复制。填进客户端的「服务器地址」就可以连上来。
 
 - 公网地址：从外部服务探测，用于别人连你
 - 内网地址：本机网卡上的私有地址，用于同一个局域网里的设备
@@ -61,6 +61,23 @@
 链路本地地址（`169.254.x.x`）会被排除，它们连不到任何地方。
 
 探测公网地址意味着这台机器的出口 IP 会被第三方服务看到。探测失败时会如实显示原因，不影响服务本身。
+
+## 数据放在哪
+
+程序和数据分开。新装时数据写在程序目录之外：
+
+| 平台 | 位置 |
+|---|---|
+| Windows | `%ProgramData%\3e-schedule-server\data`；没有这个变量时用 `%LOCALAPPDATA%` |
+| Linux / macOS | `$XDG_DATA_HOME/3e-schedule-server/data`；没有就用 `~/.local/share/3e-schedule-server/data` |
+
+证书在同一个根目录下的 `certs/`。
+
+`data_dir` / `cert_dir` 留空就是这个行为。填了路径就按填的来，相对路径以 exe 所在目录为基准。
+
+旧版本装在程序目录里的（`data/schedule.db` 就在 exe 旁边），升级后仍然读那一份，不会自己搬家。概览页会提示，点「搬到 …」把它复制到上面那个位置，原目录保留。
+
+环境变量 `SCHEDULE_SERVER_ROOT` 可以改这个根目录。一台机器上跑多个实例时用它分开。
 
 
 ## 运行环境
@@ -75,12 +92,12 @@
 
 ## 快速开始（Windows）
 
-1. 把 `schedule-server.exe` 放进一个**可写目录**。不要放 `Program Files`，那里普通用户无法写数据。
+1. 把 `schedule-server.exe` 放进任意目录。数据不写在这里，放哪都行。
 2. 双击运行。程序会启动服务核心，并打开管理面板。
 3. 浏览器地址是 `http://127.0.0.1:9800`。第一次打开时按提示创建管理员账号。
-4. 在客户端里填服务器地址：`https://<这台机器的 IP 或域名>:8443`。
+4. 概览页第一块列出这台机器的公网与内网地址，复制一条填进客户端的「服务器地址」。
 
-首次启动会自动生成一张本地 CA 和一张服务端证书，放在 `certs/` 目录：
+首次启动会自动生成一张本地 CA 和一张服务端证书，放在数据根目录的 `certs/` 下：
 
 ```
 certs/ca.crt        导入客户端设备，用于信任自签证书
@@ -89,6 +106,12 @@ certs/server.key    服务端私钥（权限 0600）
 ```
 
 如果客户端不校验自签证书，可以跳过导入。生产环境建议在面板里上传正式证书。
+
+## 更新
+
+停掉服务，换掉 `schedule-server.exe` 就行。`data/`、`certs/`、`config.json` 不用动。
+
+数据在程序目录之外，所以整个程序目录删掉重装也没有影响 —— 新 exe 启动时去同一个位置找数据。
 
 ## 命令行
 
@@ -120,8 +143,8 @@ data/logs/console.log   子进程的标准输出
 | `http_addr` | 空 | 额外的明文 HTTP 监听，适合放在反向代理后面 |
 | `wordbook_addr` | 空 | 背词同步通道，留空关闭 |
 | `internal_addr` | `127.0.0.1:0` | 面板调用的内部回环地址，`0` 表示随机端口 |
-| `data_dir` | `data` | 数据库、日志、备份 |
-| `cert_dir` | `certs` | 证书目录 |
+| `data_dir` | 空 | 数据库、日志、备份。空 = 程序目录之外，见「数据放在哪」 |
+| `cert_dir` | 空 | 证书目录。空 = 和数据同一个根目录 |
 | `server_name` | 空 | 生成证书时签入的域名 |
 | `auto_cert` | `true` | 证书缺失时自动生成自签证书 |
 | `invite_code` | 空 | 注册邀请码，空则首次启动自动生成 |
@@ -141,7 +164,7 @@ data/logs/console.log   子进程的标准输出
 
 | 页面 | 内容 |
 |---|---|
-| 概览 | 运行状态、账号/日历/日程数量、快捷操作、最近日志 |
+| 概览 | 客户端连接地址、运行状态、账号/日历/日程数量、快捷操作、最近日志 |
 | 服务 | 启动/停止/重启、地址探测、监听与目录、证书生成与上传、日志 |
 | 账号 | 搜索、详情、封禁、管理员、删除、批量创建、邀请码 |
 | 内容审核 | 违禁词增删改、待处理举报、AI 复核配置与测试 |
@@ -241,24 +264,27 @@ schedule-server.exe -import-db "D:/old/data/schedule.db"
 
 ## 构建
 
-需要 Go 1.23 或更高版本。`go.mod` 声明了 1.25，Go 会自动下载对应工具链。
+需要 Go 1.23 或更高版本。`go.mod` 声明了 1.25，Go 会自动下载对应工具链。打发布包另外需要 Python 3（只用标准库里的 zipfile）。
 
-Windows：
-
-```powershell
-./scripts/build-windows.ps1
-```
-
-Linux / macOS：
+打完整的发布包：
 
 ```bash
-./scripts/build-unix.sh
+node scripts/package.mjs
+```
+
+产物：`build/schedule-server.exe`（编译结果）和 `dist/` 下两个 zip。脚本会先检查 `build/`、`dist/` 里有没有 `data/`、`certs/`、`config.json`，有就直接停下 —— 那是运行时的数据，不能当构建目录用。
+
+只编译：
+
+```text
+scripts/build-windows.ps1      Windows
+scripts/build-unix.sh          Linux / macOS
 ```
 
 手动构建：
 
 ```bash
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/schedule-server ./cmd/schedule-server
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/schedule-server ./cmd/schedule-server
 ```
 
 Windows 想隐藏控制台窗口，追加 `-H windowsgui`。
@@ -278,7 +304,7 @@ internal/panel/          管理面板后端与内嵌前端
 scripts/                 构建脚本
 ```
 
-运行时目录：
+运行时目录（默认在程序目录之外，见「数据放在哪」）：
 
 ```
 data/schedule.db         主数据库（SQLite WAL）

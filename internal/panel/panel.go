@@ -51,6 +51,10 @@ type Panel struct {
 	lastErr   string
 	restarts  int
 
+	// relocating 挡住并发的"搬数据目录"：搬的过程中会停服务、改配置，
+	// 两个请求同时进来会互相覆盖。
+	relocating bool
+
 	sessions map[string]*session
 
 	httpSrv  *http.Server

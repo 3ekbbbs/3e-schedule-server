@@ -3,6 +3,10 @@
 // 配置文件默认放在 exe 同目录的 config.json。相对路径（data / certs）
 // 一律相对 **exe 所在目录** 解析，而不是当前工作目录 —— 双击启动时
 // 工作目录是资源管理器给的，计划任务里又是另一个，靠 cwd 会到处写数据。
+//
+// data_dir / cert_dir 留空表示自动：新装直接落到程序目录之外
+// （Windows 是 %ProgramData%\3e-schedule-server），老部署原地不动。
+// 更新时替换 exe 不会碰数据。
 package config
 
 import (
@@ -10,6 +14,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -74,8 +79,8 @@ func Defaults() Config {
 		HTTPAddr:     "",
 		WordbookAddr: "",
 		InternalAddr: "127.0.0.1:0",
-		CertDir:      "certs",
-		DataDir:      "data",
+		CertDir:      "",
+		DataDir:      "",
 		ServerName:   "",
 		AutoCert:     true,
 		InviteCode:   "",
@@ -140,12 +145,9 @@ func (c *Config) normalize() {
 	if c.InternalAddr == "" {
 		c.InternalAddr = "127.0.0.1:0"
 	}
-	if c.DataDir == "" {
-		c.DataDir = "data"
-	}
-	if c.CertDir == "" {
-		c.CertDir = "certs"
-	}
+	// data_dir / cert_dir 留空表示"自动"：解析时落到程序目录之外，
+	// 老部署（程序目录里已经有库或证书）仍然原地使用。见 Resolve。
+	c.PanelListen = strings.TrimSpace(c.PanelListen)
 	if c.PanelListen == "" {
 		c.PanelListen = "127.0.0.1:9800"
 	}
@@ -154,18 +156,79 @@ func (c *Config) normalize() {
 	}
 }
 
-// Resolve 返回一份把相对目录解析到 baseDir 的副本。
+// Resolve 返回一份把目录解析成绝对路径的副本。
 // baseDir 应当是 exe 所在目录。
+//
+// 目录留空时的规则：
+//
+//	程序目录里已经有 schedule.db / server.crt → 就用程序目录里这份。
+//	                                          老部署的数据不能背着用户搬走。
+//	都没有                                     → 落到 DataRoot(baseDir)，在程序目录之外。
+//
+// 这样"替换 exe"不会碰到数据，而老机器升级后照样读得到原来的库。
 func (c Config) Resolve(baseDir string) Config {
-	if !filepath.IsAbs(c.DataDir) {
+	dataInProgram := fileExists(filepath.Join(baseDir, "data", "schedule.db"))
+	certInProgram := fileExists(filepath.Join(baseDir, "certs", "server.crt"))
+
+	if c.DataDir == "" {
+		if dataInProgram {
+			c.DataDir = filepath.Join(baseDir, "data")
+		} else {
+			c.DataDir = filepath.Join(DataRoot(baseDir), "data")
+		}
+	} else if !filepath.IsAbs(c.DataDir) {
 		c.DataDir = filepath.Join(baseDir, c.DataDir)
 	}
-	if !filepath.IsAbs(c.CertDir) {
+
+	if c.CertDir == "" {
+		if dataInProgram || certInProgram {
+			c.CertDir = filepath.Join(baseDir, "certs")
+		} else {
+			c.CertDir = filepath.Join(DataRoot(baseDir), "certs")
+		}
+	} else if !filepath.IsAbs(c.CertDir) {
 		c.CertDir = filepath.Join(baseDir, c.CertDir)
 	}
+
 	c.DataDir = filepath.Clean(c.DataDir)
 	c.CertDir = filepath.Clean(c.CertDir)
 	return c
+}
+
+// DataRoot 返回这台机器上放数据的根目录，在程序目录之外。
+//
+//	Windows  %ProgramData%\3e-schedule-server
+//	其他     $XDG_DATA_HOME/3e-schedule-server（没有就用 ~/.local/share/...）
+//
+// 环境变量 SCHEDULE_SERVER_ROOT 可以覆盖，装在两台机器上、或者测试时
+// 同时跑几个实例要靠它区分。
+func DataRoot(baseDir string) string {
+	if v := strings.TrimSpace(os.Getenv("SCHEDULE_SERVER_ROOT")); v != "" {
+		return filepath.Clean(v)
+	}
+	if runtime.GOOS == "windows" {
+		if v := strings.TrimSpace(os.Getenv("ProgramData")); v != "" {
+			return filepath.Join(v, "3e-schedule-server")
+		}
+		if v := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); v != "" {
+			return filepath.Join(v, "3e-schedule-server")
+		}
+	} else {
+		if v := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); v != "" {
+			return filepath.Join(v, "3e-schedule-server")
+		}
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, ".local", "share", "3e-schedule-server")
+		}
+	}
+	// 什么都拿不到：退回程序目录。这是最后手段 —— 至少服务能起来，
+	// 面板首页会提示数据还在程序目录里。
+	return filepath.Join(baseDir, ".3e-schedule-server")
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }
 
 // Validate 在保存前做最小校验，返回的错误可以直接展示给用户。
