@@ -378,7 +378,7 @@ pre.log {
 .kv .k { color: var(--muted); }
 .kv .v { word-break: break-all; }
 
-.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); padding: 0 14px; background: #fafbfd; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); padding: 0 14px; background: #fafbfd; overflow-x: auto; }
 .tabs button {
   border: none;
   background: none;

@@ -1150,12 +1150,14 @@ async function renderMaintenance() {
     <button data-tab="backup" class="${S.maintTab === 'backup' ? 'active' : ''}">备份与恢复</button>
     <button data-tab="repair" class="${S.maintTab === 'repair' ? 'active' : ''}">数据修复</button>
     <button data-tab="logs" class="${S.maintTab === 'logs' ? 'active' : ''}">账号日志</button>
+    <button data-tab="audit" class="${S.maintTab === 'audit' ? 'active' : ''}">AI 审计</button>
     <button data-tab="system" class="${S.maintTab === 'system' ? 'active' : ''}">系统信息</button>
   </div>`;
   let body = '';
   if (S.maintTab === 'backup') body = await renderBackup();
   else if (S.maintTab === 'repair') body = renderRepair(st);
   else if (S.maintTab === 'logs') body = await renderLoginLogs();
+  else if (S.maintTab === 'audit') body = await renderAudit();
   else body = await renderSystem();
   return tabs + `<div style="border:1px solid var(--border);border-top:none;border-radius:0 0 12px 12px;background:var(--card)">${body}</div>`;
 }
@@ -1223,6 +1225,37 @@ async function renderLoginLogs() {
       <div class="grow"></div><button class="btn sm" data-act="logs-reload">刷新</button></div>
     <div style="overflow:auto"><table>
       <thead><tr><th>时间</th><th>账号</th><th>事件</th><th>结果</th><th>原因</th><th>IP</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+}
+
+async function renderAudit() {
+  let d = { audits: [] };
+  try { d = await sget('/api/admin/moderation-audit?limit=100'); } catch (e) { d = { audits: [], error: e.message }; }
+  const list = d.audits || [];
+  const rows = list.length ? list.map((a) => {
+    const verdict = a.violation
+      ? '<span class="badge bad">违规</span>'
+      : (a.source === 'error'
+        ? '<span class="badge warn">调用失败</span>'
+        : '<span class="badge ok">合规</span>');
+    return `<tr>
+      <td class="nowrap">${esc(fmtTime(a.created_at))}</td>
+      <td>${esc(a.field || '—')}</td>
+      <td class="small">${esc(a.excerpt || '')}</td>
+      <td>${verdict}</td>
+      <td>${esc(a.source || '')}</td>
+      <td class="small muted">${esc(a.reason || a.error_text || '')}</td>
+      <td class="nowrap">${esc(a.model || '')}${a.elapsed_ms ? ` · ${a.elapsed_ms}ms` : ''}</td>
+    </tr>`;
+  }).join('') : emptyRow(7, d.error ? '读取失败：' + d.error : '暂无记录。');
+  const sum = `<div class="row" style="padding:14px 18px;border-bottom:1px solid var(--border)">
+      <span class="badge bad">违规 ${esc(d.stat_violation || 0)}</span>
+      <span class="badge warn">调用失败 ${esc(d.stat_error || 0)}</span>
+      <span class="badge neutral">未启用 ${esc(d.stat_disabled || 0)}</span>
+      <span class="small muted">共 ${esc(d.total || list.length)} 条</span>
+    </div>`;
+  return sum + `<div style="overflow:auto"><table>
+      <thead><tr><th>时间</th><th>字段</th><th>内容摘要</th><th>结果</th><th>来源</th><th>说明</th><th>模型 / 耗时</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
 }
 
