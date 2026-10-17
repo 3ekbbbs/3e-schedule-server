@@ -8,7 +8,7 @@ import (
 )
 
 // version 是服务端版本号。发版时同步 README 的版本表。
-const version = "1.0.0"
+const version = "1.1.0"
 
 // Version 供入口与面板读取。
 func Version() string { return version }
