@@ -64,6 +64,12 @@ func (s *Server) userForKey(key string) string {
 // same context value, which is why the rest of the server does not care.
 func (s *Server) authOrKey(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 联动下载（2026-10-18）：别的服务器拿本机的部署令牌来取文件。
+		// relayAllowedPath 把这条路钉死在四个下载前缀上，令牌不能用来干别的。
+		if s.relayAuthorized(r) {
+			next(w, r.WithContext(context.WithValue(r.Context(), ctxUserID, "")))
+			return
+		}
 		h := r.Header.Get("Authorization")
 		tok := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
 		if tok == "" {

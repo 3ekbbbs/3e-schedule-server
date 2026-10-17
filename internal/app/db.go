@@ -530,6 +530,35 @@ CREATE TABLE IF NOT EXISTS login_logs(
 );
 CREATE INDEX IF NOT EXISTS idx_loginlog_time ON login_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_loginlog_user ON login_logs(user_id, created_at);
+
+-- 联动服务器（2026-10-18）。
+--
+-- 这里只存"怎么找到它"，不存它的账号。账号永远只属于一台服务器 ——
+-- 联动分的是**文件**（安装包、插件、包数据），不是身份。
+--
+-- token 是对方服务器的部署令牌，用来调对方的 /api/admin/federation/snapshot。
+-- 面板显示时一律打码；导出快照时**不导出**。
+CREATE TABLE IF NOT EXISTS federation_peers(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  base_url TEXT NOT NULL DEFAULT '',
+  token TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  last_ok_at INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS distribution_routes(
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL DEFAULT 'all',
+  match_key TEXT NOT NULL DEFAULT '',
+  peer_id TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT 'route',
+  priority INTEGER NOT NULL DEFAULT 100,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_routes_peer ON distribution_routes(peer_id);
 `
 
 func (d *DB) migrate() error {
@@ -562,6 +591,9 @@ func (d *DB) migrate() error {
 	// 双语义：只有一个"没有期限"的表示，判断就永远只有一句
 	//（`until > 0 && until <= now`），不会出现"NULL 与 0 到底哪个是永久"的分歧。
 	d.ensureColumn("users", "ban_until", "INTEGER NOT NULL DEFAULT 0")
+	// 联动对端是否跳过证书校验（2026-10-18）。默认 0：本程序默认发自签证书，
+	// 但"默认不校验"会让任何中间人都能冒充对端，所以必须由人显式打开。
+	d.ensureColumn("federation_peers", "insecure", "INTEGER NOT NULL DEFAULT 0")
 	d.repairSharedReminderOwners()
 	d.repairTaskFlags()
 	return nil

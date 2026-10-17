@@ -44,6 +44,26 @@ type updateArtifact struct {
 	Notes       string `json:"notes"`
 	Mandatory   bool   `json:"mandatory"`
 	PublishedAt int64  `json:"published_at"`
+
+	// Enabled 是"这个包对外发不发"（2026-10-18）。
+	//
+	// 用指针而不是 bool：老 manifest 里没有这个键，反序列化后 nil。
+	// 如果把 nil 当成 false，升级到这一版的服务器会**瞬间停掉所有分发**，
+	// 而客户端只会说"没有新版本"，没有任何地方能看出原因。
+	// nil 一律解释为"启用"，只有显式写了 false 才是停用。
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Source 记录这个包是怎么来的：空/"local" 是本机上传，"clone" 是从别的
+	// 站点拉过来的。面板用它决定要不要显示"来源"这一列。
+	Source string `json:"source,omitempty"`
+}
+
+// isEnabled 把 nil 解释成启用。见 Enabled 字段上的说明。
+func (a *updateArtifact) isEnabled() bool {
+	if a == nil {
+		return false
+	}
+	return a.Enabled == nil || *a.Enabled
 }
 
 type updateManifest struct {
@@ -128,7 +148,7 @@ func (s *Server) handleUpdatesPublic(w http.ResponseWriter, r *http.Request) {
 		case "windows":
 			art = m.Windows
 		}
-		if art == nil {
+		if art == nil || !art.isEnabled() {
 			out[p] = nil
 			continue
 		}
@@ -171,7 +191,7 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, 400, "platform 只能是 android 或 windows")
 		return
 	}
-	if art == nil {
+	if art == nil || !art.isEnabled() {
 		writeJSON(w, 200, out)
 		return
 	}
@@ -230,6 +250,14 @@ func (s *Server) handleUpdateDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if art == nil {
 		apiErr(w, 404, "这个平台还没有可下载的更新包")
+		return
+	}
+	if !art.isEnabled() {
+		apiErr(w, 404, "这个平台的更新包已停止分发")
+		return
+	}
+	// 联动路由：命中规则就交给别的服务器发（见 federation.go）。
+	if s.tryRoute(w, r, "update", platform) {
 		return
 	}
 	full := filepath.Join(s.updatesDir(), filepath.Base(art.File))

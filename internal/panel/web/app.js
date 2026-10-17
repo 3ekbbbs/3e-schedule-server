@@ -477,6 +477,26 @@ async function mountOverview() {
 
 // ---------------------------------------------------------------- 服务
 
+function netInfoHTML(d) {
+  if (!d) return '<div class="alert bad">没有拿到网络信息</div>';
+  const copyBtn = (v) => `<button class="btn sm" data-copy="${esc(v)}">复制</button>`;
+  const pub = d.public_ok
+    ? `<span class="mono">${esc(d.url_public)}</span> ${copyBtn(d.url_public)}`
+    : `<span class="muted">探测失败：${esc(d.public_error || '未知原因')}</span>`;
+  const lan = (d.url_lan || []).length
+    ? d.url_lan.map((u) => `<div style="margin-bottom:6px"><span class="mono">${esc(u)}</span> ${copyBtn(u)}</div>`).join('')
+    : '<span class="muted">没有找到内网地址</span>';
+  const ifaces = (d.local || []).map((a) =>
+    `<div class="small muted mono">${esc(a.name)} ${esc(a.addr)}${a.loopback ? ' · 回环' : a.link_local ? ' · 链路本地，不可用' : a.private ? ' · 内网' : ' · 公网'}</div>`).join('');
+  return `<div class="kv">
+    <div class="k">公网地址</div><div class="v">${pub}</div>
+    <div class="k">内网地址</div><div class="v">${lan}</div>
+    <div class="k">本机</div><div class="v"><span class="mono">${esc(d.url_local || '')}</span></div>
+    <div class="k">端口</div><div class="v">${esc(String(d.port || ''))}（${esc(d.scheme || 'https')}）</div>
+  </div>
+  ${ifaces ? `<details style="margin-top:12px"><summary class="small muted">所有网卡地址</summary>${ifaces}</details>` : ''}`;
+}
+
 async function renderServer() {
   const st = await refreshState();
   const c = st.config || {};
@@ -497,6 +517,13 @@ async function renderServer() {
         ${st.server.last_error ? `<div class="alert bad" style="margin-top:14px">最近错误：${esc(st.server.last_error)}</div>` : ''}
       </div>
     </div>
+
+    ${card('访问地址', `
+      <div id="netBox"><div class="empty">点下面的按钮探测本机地址</div></div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn" data-act="net-probe">探测地址</button>
+        <span class="muted small">公网地址给别人连；内网地址给同一个局域网里的设备用</span>
+      </div>`, { sub: '部署和局域网同步时填这里' })}
 
     ${card('监听与目录', `
       <form id="cfgForm">
@@ -554,9 +581,32 @@ async function renderServer() {
 async function mountServer() {
   const view = $('#view');
   view.onclick = async (e) => {
+    const cp = e.target.closest('[data-copy]');
+    if (cp) {
+      try {
+        await navigator.clipboard.writeText(cp.dataset.copy);
+        toast('已复制', 'ok');
+      } catch (err) {
+        toast('复制失败，请手动选中', 'err');
+      }
+      return;
+    }
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     const act = btn.dataset.act;
+    if (act === 'net-probe') {
+      btn.disabled = true;
+      btn.textContent = '探测中…';
+      try {
+        const d = await sget('/api/admin/netinfo');
+        $('#netBox').innerHTML = netInfoHTML(d);
+      } catch (err) {
+        fail(err);
+      }
+      btn.disabled = false;
+      btn.textContent = '探测地址';
+      return;
+    }
     if (act === 'start' || act === 'stop' || act === 'restart') {
       btn.disabled = true;
       try {
@@ -694,6 +744,7 @@ async function renderAccounts() {
       <td>${u.banned ? `<span class="badge bad">已封禁</span>${u.ban_reason ? `<div class="small muted">${esc(u.ban_reason)}</div>` : ''}` : '<span class="badge ok">正常</span>'}</td>
       <td class="nowrap">${esc(fmtTime(u.created_at))}</td>
       <td class="right nowrap">
+        <button class="btn sm" data-act="detail" data-id="${esc(u.id)}">详情</button>
         <button class="btn sm" data-act="admin" data-id="${esc(u.id)}" data-name="${esc(u.name)}" data-value="${u.is_admin ? '0' : '1'}">${u.is_admin ? '取消管理员' : '设为管理员'}</button>
         <button class="btn sm" data-act="ban" data-id="${esc(u.id)}" data-name="${esc(u.name)}" data-value="${u.banned ? '0' : '1'}">${u.banned ? '解封' : '封禁'}</button>
         <button class="btn sm danger" data-act="del" data-id="${esc(u.id)}" data-name="${esc(u.name)}">删除</button>
@@ -775,6 +826,10 @@ async function mountAccounts() {
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     const { act, id, name, value } = btn.dataset;
+    if (act === 'detail') {
+      try { await showUserDetail(id); } catch (err) { fail(err); }
+      return;
+    }
     if (act === 'admin') {
       const want = value === '1';
       if (!(await confirmBox({ title: want ? '设为管理员' : '取消管理员', text: `${name}：${want ? '将获得全部管理权限。' : '将失去管理权限。'}`, danger: !want }))) return;
@@ -811,6 +866,88 @@ async function mountAccounts() {
       catch (err) { fail(err); }
     }
   };
+}
+
+// ---------------------------------------------------------------- 账号详情
+
+// showUserDetail 是一个只读的信息页：这个人的日历、日程、设备、最近登录。
+// 用它回答"删掉这个账号会连带删掉多少东西"。
+async function showUserDetail(id) {
+  const d = await sget('/api/admin/users/' + encodeURIComponent(id) + '/detail');
+  const s = d.summary || {};
+  const calRows = (d.calendars || []).length
+    ? d.calendars.map((c) => `<tr>
+        <td>${esc(c.name || '未命名')}</td>
+        <td>${c.mine ? '<span class="badge plain ok">自己的</span>' : '<span class="badge plain neutral">共享来的</span>'}</td>
+        <td class="mono small">${esc(c.kind || '')}</td>
+        <td class="right">${c.events}</td>
+      </tr>`).join('')
+    : `<tr><td colspan="4"><div class="empty">没有日历</div></td></tr>`;
+  const evRows = (d.recent_events || []).length
+    ? d.recent_events.map((e) => `<tr>
+        <td>${esc(e.title || '(无标题)')}${e.is_task ? ' <span class="badge plain neutral">待办</span>' : ''}</td>
+        <td class="small muted">${esc(e.calendar)}</td>
+        <td class="nowrap small">${e.start_at ? fmtTime(e.start_at) : '—'}</td>
+      </tr>`).join('')
+    : `<tr><td colspan="3"><div class="empty">没有日程</div></td></tr>`;
+  const devRows = (d.devices_detail || []).length
+    ? d.devices_detail.map((x) => `<tr>
+        <td>${esc(x.name || '—')}</td>
+        <td>${esc(x.platform || '')}</td>
+        <td>${esc(x.version || '')}</td>
+        <td class="nowrap small">${x.last_seen_at ? fmtAgo(x.last_seen_at) : '—'}</td>
+      </tr>`).join('')
+    : `<tr><td colspan="4"><div class="empty">没有设备上报</div></td></tr>`;
+  const logRows = (d.recent_logins || []).length
+    ? d.recent_logins.map((l) => `<tr>
+        <td>${esc(l.event)}</td>
+        <td>${l.result === 'success' ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>'}</td>
+        <td class="mono small">${esc(l.ip || '—')}</td>
+        <td class="nowrap small">${fmtTime(l.at)}</td>
+      </tr>`).join('')
+    : `<tr><td colspan="4"><div class="empty">没有登录记录</div></td></tr>`;
+
+  const ban = d.banned || {};
+  const host = $('#modalHost');
+  host.innerHTML = `<div class="modal-mask">
+    <div class="modal" style="max-width:720px">
+      <h3>${esc(d.name)}${d.is_admin ? ' <span class="badge plain ok">管理员</span>' : ''}${ban.active ? ' <span class="badge bad">已封禁</span>' : ''}</h3>
+      <div class="modal-body" style="max-height:70vh;overflow:auto">
+        <div class="grid cols-4">
+          ${statCard('日历', String(s.calendars_owned || 0), '自己的', '')}
+          ${statCard('日程', String(s.events_owned || 0), '自己的', '')}
+          ${statCard('共享', String(s.calendars_shared || 0), '别人给的', '')}
+          ${statCard('设备', String(s.devices || 0), '上报过', '')}
+        </div>
+        <div class="small muted">账号 ID <span class="mono">${esc(d.id)}</span> · 创建于 ${fmtTime(d.created_at)}</div>
+        ${ban.active ? `<div class="alert bad">封禁原因：${esc(ban.reason || '未填写')}${ban.until ? '，到期 ' + fmtTime(ban.until) : '，永久'}</div>` : ''}
+
+        <h3 style="font-size:13px;margin:8px 0 6px">日历</h3>
+        <div style="overflow:auto"><table>
+          <thead><tr><th>名称</th><th>归属</th><th>类型</th><th class="right">日程数</th></tr></thead>
+          <tbody>${calRows}</tbody></table></div>
+
+        <h3 style="font-size:13px;margin:14px 0 6px">最近日程</h3>
+        <div style="overflow:auto"><table>
+          <thead><tr><th>标题</th><th>日历</th><th>开始</th></tr></thead>
+          <tbody>${evRows}</tbody></table></div>
+
+        <h3 style="font-size:13px;margin:14px 0 6px">设备</h3>
+        <div style="overflow:auto"><table>
+          <thead><tr><th>名称</th><th>平台</th><th>版本</th><th>最近上报</th></tr></thead>
+          <tbody>${devRows}</tbody></table></div>
+
+        <h3 style="font-size:13px;margin:14px 0 6px">最近登录</h3>
+        <div style="overflow:auto"><table>
+          <thead><tr><th>事件</th><th>结果</th><th>IP</th><th>时间</th></tr></thead>
+          <tbody>${logRows}</tbody></table></div>
+      </div>
+      <div class="modal-foot"><button type="button" class="btn" data-x="close">关闭</button></div>
+    </div>
+  </div>`;
+  const close = () => closeModal();
+  $('[data-x="close"]', host).onclick = close;
+  $('.modal-mask', host).onclick = (e) => { if (e.target.classList.contains('modal-mask')) close(); };
 }
 
 // ---------------------------------------------------------------- 审核
@@ -1008,20 +1145,105 @@ async function mountModeration() {
 async function renderDistribution() {
   await refreshState();
   if (!S.state.server.running) return '<div class="alert warn">服务未运行，分发功能不可用。</div>';
+  const tab = S.distTab || 'updates';
   const tabs = `<div class="tabs" style="border:1px solid var(--border);border-bottom:none;border-radius:12px 12px 0 0">
-    <button data-tab="updates" class="${S.distTab === 'updates' ? 'active' : ''}">客户端更新</button>
-    <button data-tab="plugins" class="${S.distTab === 'plugins' ? 'active' : ''}">插件</button>
-    <button data-tab="devices" class="${S.distTab === 'devices' ? 'active' : ''}">设备</button>
+    <button data-tab="updates" class="${tab === 'updates' ? 'active' : ''}">客户端更新</button>
+    <button data-tab="plugins" class="${tab === 'plugins' ? 'active' : ''}">插件</button>
+    <button data-tab="devices" class="${tab === 'devices' ? 'active' : ''}">设备</button>
+    <button data-tab="federation" class="${tab === 'federation' ? 'active' : ''}">联动服务器</button>
   </div>`;
   let body = '';
-  if (S.distTab === 'updates') body = await renderUpdates();
-  else if (S.distTab === 'plugins') body = await renderPlugins();
+  if (tab === 'updates') body = await renderUpdates();
+  else if (tab === 'plugins') body = await renderPlugins();
+  else if (tab === 'federation') body = await renderFederation();
   else body = await renderDevices();
   return tabs + `<div style="border:1px solid var(--border);border-top:none;border-radius:0 0 12px 12px;background:var(--card)">${body}</div>`;
 }
 
+// 一个平台的当前状态卡。enabled 缺省视为启用 —— 老 manifest 没这个键。
+function updateCard(platform, label, a) {
+  if (!a) {
+    return `<div class="card">
+      <div class="card-head"><h3>${label}</h3><span class="badge neutral">未发布</span></div>
+      <div class="card-body"><div class="empty">还没有发布过这个平台的安装包</div></div>
+    </div>`;
+  }
+  const on = a.enabled === undefined || a.enabled === null ? true : !!a.enabled;
+  const size = a.file_exists ? a.file_size : a.size;
+  return `<div class="card">
+    <div class="card-head">
+      <h3>${label}</h3>
+      <span class="badge ${on ? 'ok' : 'neutral'}">${on ? '分发中' : '已停用'}</span>
+      ${a.file_exists ? '' : '<span class="badge bad">文件缺失</span>'}
+    </div>
+    <div class="card-body">
+      <div class="kv">
+        <div class="k">版本</div>
+        <div class="v">${esc(a.version)}${a.version_code ? ` <span class="muted">· code ${a.version_code}</span>` : ''}</div>
+        <div class="k">文件</div>
+        <div class="v mono small">${esc(a.file)}</div>
+        <div class="k">大小</div>
+        <div class="v">${size ? fmtBytes(size) : '—'}</div>
+        <div class="k">SHA256</div>
+        <div class="v mono small">${esc((a.sha256 || '').slice(0, 24))}${a.sha256 ? '…' : ''}</div>
+        <div class="k">发布时间</div>
+        <div class="v">${a.published_at ? fmtTime(a.published_at) : '—'}</div>
+        <div class="k">来源</div>
+        <div class="v">${a.source === 'clone' ? '从别处克隆' : '本机上传'}</div>
+        <div class="k">下载地址</div>
+        <div class="v mono small">${esc(a.download_url || '')}</div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn sm" data-act="upd-toggle" data-platform="${platform}" data-on="${on ? '0' : '1'}">${on ? '停止分发' : '恢复分发'}</button>
+        <button class="btn sm" data-act="upd-edit" data-platform="${platform}">改版本说明</button>
+        <button class="btn sm danger" data-act="upd-del" data-platform="${platform}">删除</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 async function renderUpdates() {
+  let d = null;
+  try { d = await sget('/api/admin/updates'); } catch (e) { d = null; }
+  if (!d) return '<div class="card-body"><div class="alert bad">读不到分发状态</div></div>';
   return `<div class="card-body">
+    <div class="grid cols-2">
+      ${updateCard('android', 'Android', d.android)}
+      ${updateCard('windows', 'Windows', d.windows)}
+    </div>
+
+    <div class="alert info" style="margin-top:16px">
+      停用只影响分发，文件还在磁盘上。恢复分发不需要重新上传。
+      ${d.cos_base ? `安装包地址当前指向对象存储：<span class="mono">${esc(d.cos_base)}</span>` : '安装包地址当前指向本机。配好存储桶后可以在「设置」里改。'}
+    </div>
+
+    <h3 style="font-size:14px;margin:26px 0 12px">从别的站点克隆</h3>
+    <form id="cloneForm">
+      <div class="form-grid">
+        <div class="field"><label>源站地址</label><input type="text" name="source_url" placeholder="https://example.com" required><span class="hint">填官网地址。会读它的 /api/downloads</span></div>
+        <div class="field"><label>平台</label><select name="platform">
+          <option value="android">Android（APK）</option>
+          <option value="windows">Windows</option>
+        </select></div>
+        <div class="field"><label>版本号</label><input type="text" name="version" placeholder="留空则从文件名识别"><span class="hint">识别不出来会报错，那时再手填</span></div>
+        <div class="field"><label>版本代码</label><input type="number" name="version_code" placeholder="Android 必填"><span class="hint">只能比当前版本大</span></div>
+        <div class="field full"><label>说明</label><input type="text" name="notes" placeholder="留空则记为来源地址"></div>
+        <div class="field full">
+          <label>源站令牌</label>
+          <input type="password" name="token" placeholder="克隆官网时留空；克隆另一台本程序时必填">
+          <span class="hint">对方的部署令牌，或管理员账号令牌</span>
+        </div>
+        <div class="field full">
+          <label class="check"><input type="checkbox" name="insecure"> 跳过证书校验</label>
+          <span class="hint">对方是自签证书时勾选。公网站点不要勾</span>
+        </div>
+      </div>
+      <div class="row end" style="margin-top:14px">
+        <button class="btn primary" type="submit">克隆到本机</button>
+      </div>
+    </form>
+
+    <h3 style="font-size:14px;margin:26px 0 12px">本机上传</h3>
     <form id="updForm">
       <div class="form-grid">
         <div class="field"><label>平台</label><select name="platform">
@@ -1042,6 +1264,97 @@ async function renderUpdates() {
     </div>
   </div>`;
 }
+
+// 联动服务器：对端清单 + 路由规则 + 快照导入导出。
+async function renderFederation() {
+  let peers = [], routes = [];
+  try {
+    const [p, r] = await Promise.all([
+      sget('/api/admin/federation/peers'),
+      sget('/api/admin/federation/routes'),
+    ]);
+    peers = (p && p.peers) || [];
+    routes = (r && r.routes) || [];
+  } catch (e) {
+    return '<div class="card-body"><div class="alert bad">读不到联动配置</div></div>';
+  }
+  const peerName = (id) => {
+    const p = peers.find((x) => x.id === id);
+    return p ? p.name : '(已删除)';
+  };
+  const peerRows = peers.length ? peers.map((p) => `<tr>
+    <td>${esc(p.name)}<div class="small muted mono">${esc(p.base_url)}</div></td>
+    <td>${p.enabled ? '<span class="badge ok">启用</span>' : '<span class="badge neutral">停用</span>'}</td>
+    <td>${p.has_token ? '<span class="badge ok">已配</span>' : '<span class="badge warn">未配</span>'}</td>
+    <td class="small">${p.last_ok_at ? '最近连通 ' + fmtAgo(p.last_ok_at) : '从未连通'}</td>
+    <td class="small muted">${esc(p.last_error || '')}</td>
+    <td class="right nowrap">
+      <button class="btn sm" data-act="peer-test" data-id="${p.id}">测连通</button>
+      <button class="btn sm" data-act="peer-edit" data-id="${p.id}">编辑</button>
+      <button class="btn sm danger" data-act="peer-del" data-id="${p.id}">删除</button>
+    </td></tr>`).join('') : emptyRow(6, '还没有添加联动服务器。');
+
+  const routeRows = routes.length ? routes.map((r) => `<tr>
+    <td>${kindLabel(r.kind)}</td>
+    <td class="mono small">${esc(r.match_key || '（全部）')}</td>
+    <td>${esc(peerName(r.peer_id))}</td>
+    <td>${r.mode === 'mirror' ? '<span class="badge warn">缓存到本机</span>' : '<span class="badge ok">直接跳转</span>'}</td>
+    <td class="small">${r.priority}</td>
+    <td>${r.enabled ? '<span class="badge ok">启用</span>' : '<span class="badge neutral">停用</span>'}</td>
+    <td class="right nowrap">
+      <button class="btn sm" data-act="route-toggle" data-id="${r.id}" data-on="${r.enabled ? '0' : '1'}">${r.enabled ? '停用' : '启用'}</button>
+      <button class="btn sm danger" data-act="route-del" data-id="${r.id}">删除</button>
+    </td></tr>`).join('') : emptyRow(7, '还没有路由规则。不配规则时全部走本机。');
+
+  return `<div class="card-body">
+    <div class="alert info">
+      联动只同步分发的文件，账号永远只属于本机。
+      <br>「直接跳转」把用户的下载请求 302 给对方，本机一个字节都不过手，对方必须公网可达。
+      「缓存到本机」由本机先从对方拉一份存下来再发给用户，适合对方在局域网里或者链路很慢。
+    </div>
+
+    <h3 style="font-size:14px;margin:22px 0 12px">对端服务器</h3>
+    <div style="overflow:auto"><table>
+      <thead><tr><th>名称 / 地址</th><th>状态</th><th>令牌</th><th>最近连通</th><th>最近错误</th><th class="right">操作</th></tr></thead>
+      <tbody>${peerRows}</tbody>
+    </table></div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn primary" data-act="peer-add">添加服务器</button>
+    </div>
+
+    <h3 style="font-size:14px;margin:26px 0 12px">分发路由</h3>
+    <div style="overflow:auto"><table>
+      <thead><tr><th>内容</th><th>匹配</th><th>走哪台</th><th>模式</th><th>优先级</th><th>状态</th><th class="right">操作</th></tr></thead>
+      <tbody>${routeRows}</tbody>
+    </table></div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn primary" data-act="route-add" ${peers.length ? '' : 'disabled'}>添加路由</button>
+      ${peers.length ? '' : '<span class="muted small">先添加一台服务器</span>'}
+    </div>
+
+    <h3 style="font-size:14px;margin:26px 0 12px">配置快照</h3>
+    <div class="row">
+      <button class="btn" data-act="fed-export">导出快照</button>
+      <button class="btn" data-act="fed-import">导入快照</button>
+      <span class="muted small">快照里没有账号、密码和令牌</span>
+    </div>
+    <div class="alert info" style="margin-top:14px">
+      把这台的快照发给另一台导入，对端清单和路由规则会一起过去。
+      版本记录不会覆盖，因为对方磁盘上没有那个文件。
+    </div>
+  </div>`;
+}
+
+function kindLabel(k) {
+  switch (k) {
+    case 'update': return '客户端更新';
+    case 'plugin': return '插件';
+    case 'navpack': return '导航包';
+    case 'skinpack': return '皮肤包';
+    default: return '全部';
+  }
+}
+
 
 async function renderPlugins() {
   let published = null, pending = null;
@@ -1102,6 +1415,177 @@ async function mountDistribution() {
     const act = btn.dataset.act;
     try {
       if (act === 'plug-reload' || act === 'dev-reload') { await navigate(); return; }
+
+      // ---- 安装包状态 ----
+      if (act === 'upd-toggle') {
+        const on = btn.dataset.on === '1';
+        await spost('/api/admin/updates/' + btn.dataset.platform + '/toggle', { enabled: on });
+        toast(on ? '已恢复分发' : '已停止分发', 'ok');
+        await navigate();
+        return;
+      }
+      if (act === 'upd-edit') {
+        const d = await sget('/api/admin/updates');
+        const a = d[btn.dataset.platform];
+        if (!a) throw new Error('这个平台还没有发布过包');
+        const f = await formModal({
+          title: '改版本说明',
+          fields: [
+            { name: 'version', label: '版本号', value: a.version },
+            { name: 'version_code', label: '版本代码', type: 'number', value: a.version_code || '' },
+            { name: 'notes', label: '发布说明', type: 'textarea', full: true, value: a.notes || '' },
+            { name: 'mandatory', label: '强制更新', type: 'checkbox', value: a.mandatory },
+          ],
+        });
+        if (!f) return;
+        await sput('/api/admin/updates/' + btn.dataset.platform, {
+          version: f.version,
+          version_code: Number(f.version_code) || 0,
+          notes: f.notes,
+          mandatory: f.mandatory,
+        });
+        toast('已保存', 'ok');
+        await navigate();
+        return;
+      }
+      if (act === 'upd-del') {
+        const ok = await confirmBox({ title: '删除安装包', text: '磁盘上的文件也会删掉，客户端将不再收到这个平台的更新。', ok: '删除', danger: true });
+        if (!ok) return;
+        await sdel('/api/admin/updates/' + btn.dataset.platform);
+        toast('已删除', 'ok');
+        await navigate();
+        return;
+      }
+
+      // ---- 联动服务器 ----
+      if (act === 'peer-add' || act === 'peer-edit') {
+        const editing = act === 'peer-edit';
+        let cur = null;
+        if (editing) {
+          const d = await sget('/api/admin/federation/peers');
+          cur = (d.peers || []).find((x) => x.id === btn.dataset.id);
+          if (!cur) throw new Error('这台服务器已经不在列表里了');
+        }
+        const f = await formModal({
+          title: editing ? '编辑服务器' : '添加服务器',
+          intro: '填对方的根地址，不要带路径。令牌用对方的 deploy-token.txt。',
+          fields: [
+            { name: 'name', label: '名称', value: cur ? cur.name : '', placeholder: '例如 机房那台' },
+            { name: 'base_url', label: '地址', full: true, value: cur ? cur.base_url : '', placeholder: 'https://example.com:8443' },
+            { name: 'token', label: '令牌', full: true, type: 'password', placeholder: editing ? '留空表示不更换' : '对方的部署令牌' },
+            { name: 'enabled', label: '启用', type: 'checkbox', value: cur ? cur.enabled : true },
+            { name: 'insecure', label: '跳过证书校验', type: 'checkbox', value: cur ? cur.insecure : false, hint: '对方是自签证书时勾选' },
+          ],
+        });
+        if (!f) return;
+        if (!String(f.base_url || '').trim()) { toast('地址不能为空', 'err'); return; }
+        if (editing) {
+          const body = { name: f.name, base_url: f.base_url, enabled: f.enabled, insecure: f.insecure };
+          if (String(f.token || '').trim()) body.token = f.token;
+          await sput('/api/admin/federation/peers/' + btn.dataset.id, body);
+        } else {
+          await spost('/api/admin/federation/peers', f);
+        }
+        toast(editing ? '已保存' : '已添加', 'ok');
+        await navigate();
+        return;
+      }
+      if (act === 'peer-del') {
+        const ok = await confirmBox({ title: '删除服务器', text: '指向它的路由规则也会一起删掉。', ok: '删除', danger: true });
+        if (!ok) return;
+        await sdel('/api/admin/federation/peers/' + btn.dataset.id);
+        toast('已删除', 'ok');
+        await navigate();
+        return;
+      }
+      if (act === 'peer-test') {
+        btn.disabled = true;
+        const r = await spost('/api/admin/federation/peers/' + btn.dataset.id + '/test', {});
+        toast(r && r.ok ? '连通正常' : '连不上：' + ((r && r.error) || '未知原因'), r && r.ok ? 'ok' : 'err');
+        await navigate();
+        return;
+      }
+      if (act === 'route-add') {
+        const d = await sget('/api/admin/federation/peers');
+        const peers = d.peers || [];
+        if (!peers.length) throw new Error('还没有可以路由的服务器');
+        const f = await formModal({
+          title: '添加路由',
+          intro: '匹配项留空表示这一类全部走那台。',
+          fields: [
+            { name: 'kind', label: '内容', type: 'select', value: 'update', options: [
+              { value: 'update', label: '客户端更新' },
+              { value: 'plugin', label: '插件' },
+              { value: 'navpack', label: '导航包' },
+              { value: 'skinpack', label: '皮肤包' },
+              { value: 'all', label: '全部内容' },
+            ] },
+            { name: 'match_key', label: '匹配项', placeholder: 'android / windows / 插件 id' },
+            { name: 'peer_id', label: '走哪台', type: 'select', value: peers[0].id,
+              options: peers.map((p) => ({ value: p.id, label: p.name })) },
+            { name: 'mode', label: '模式', type: 'select', value: 'route', options: [
+              { value: 'route', label: '直接跳转（302）' },
+              { value: 'mirror', label: '缓存到本机再发' },
+            ] },
+            { name: 'priority', label: '优先级', type: 'number', value: 100 },
+          ],
+        });
+        if (!f) return;
+        await spost('/api/admin/federation/routes', {
+          kind: f.kind, match_key: f.match_key, peer_id: f.peer_id,
+          mode: f.mode, priority: Number(f.priority) || 100,
+        });
+        toast('已添加', 'ok');
+        await navigate();
+        return;
+      }
+      if (act === 'route-toggle') {
+        await sput('/api/admin/federation/routes/' + btn.dataset.id, { enabled: btn.dataset.on === '1' });
+        await navigate();
+        return;
+      }
+      if (act === 'route-del') {
+        const ok = await confirmBox({ title: '删除路由', text: '删掉之后这类内容会回到本机分发。', ok: '删除', danger: true });
+        if (!ok) return;
+        await sdel('/api/admin/federation/routes/' + btn.dataset.id);
+        toast('已删除', 'ok');
+        await navigate();
+        return;
+      }
+      if (act === 'fed-export') {
+        const res = await fetch('/api/panel/proxy/api/admin/federation/export', {
+          headers: { 'X-Panel-Request': '1' },
+          credentials: 'same-origin',
+        });
+        if (!res.ok) throw new Error('导出失败：' + res.status);
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'federation-snapshot.json';
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        return;
+      }
+      if (act === 'fed-import') {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/json,.json';
+        input.onchange = async () => {
+          const file = input.files && input.files[0];
+          if (!file) return;
+          try {
+            const text = await file.text();
+            const data = JSON.parse(text);
+            const r = await spost('/api/admin/federation/import', data);
+            toast(`已导入：新增 ${r.added_peers} 台服务器、${r.added_routes} 条路由`, 'ok');
+            await navigate();
+          } catch (err) { fail(err); }
+        };
+        input.click();
+        return;
+      }
+
       if (act === 'plug-ok' || act === 'plug-no') {
         const approve = act === 'plug-ok';
         const f = await formModal({
@@ -1118,6 +1602,39 @@ async function mountDistribution() {
       }
     } catch (err) { fail(err); }
   };
+
+  const cloneForm = $('#cloneForm');
+  if (cloneForm) {
+    cloneForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const fd = new FormData(cloneForm);
+      const body = {
+        source_url: String(fd.get('source_url') || '').trim(),
+        platform: String(fd.get('platform') || ''),
+        version: String(fd.get('version') || '').trim(),
+        version_code: Number(fd.get('version_code') || 0),
+        notes: String(fd.get('notes') || ''),
+        token: String(fd.get('token') || '').trim(),
+        insecure: !!fd.get('insecure'),
+      };
+      if (body.platform === 'android' && !body.version_code) {
+        toast('Android 包必须填版本代码', 'err');
+        return;
+      }
+      const sub = cloneForm.querySelector('button[type=submit]');
+      sub.disabled = true;
+      sub.textContent = '正在克隆…';
+      try {
+        const r = await spost('/api/admin/updates/clone', body);
+        toast('已克隆版本 ' + ((r.artifact && r.artifact.version) || ''), 'ok');
+        await navigate();
+      } catch (err) {
+        fail(err);
+        sub.disabled = false;
+        sub.textContent = '克隆到本机';
+      }
+    };
+  }
 
   const form = $('#updForm');
   if (form) {
@@ -1351,6 +1868,37 @@ async function renderSettings() {
 
     <div style="height:16px"></div>
 
+    ${card('存储桶与 CDN', `
+      <div class="form-grid">
+        <div class="field"><label>服务商</label><select id="cosProvider">
+          <option value="tencent">腾讯云 COS</option>
+        </select></div>
+        <div class="field"><label>存储桶</label><input type="text" id="cosBucket" placeholder="my-bucket-1250000000"><span class="hint">格式是「桶名-APPID」</span></div>
+        <div class="field"><label>地域</label><select id="cosRegion">
+          <option value="ap-guangzhou">广州 ap-guangzhou</option>
+          <option value="ap-shanghai">上海 ap-shanghai</option>
+          <option value="ap-beijing">北京 ap-beijing</option>
+          <option value="ap-chengdu">成都 ap-chengdu</option>
+          <option value="ap-chongqing">重庆 ap-chongqing</option>
+          <option value="ap-nanjing">南京 ap-nanjing</option>
+          <option value="ap-hongkong">中国香港 ap-hongkong</option>
+          <option value="ap-singapore">新加坡 ap-singapore</option>
+        </select></div>
+        <div class="field"><label>CDN 加速域名</label><input type="text" id="cosCdn" placeholder="cdn.example.com"><span class="hint">填了就用它，留空用 COS 源站</span></div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn" data-act="cos-build">生成地址并填入</button>
+        <button class="btn ghost" data-act="cos-clear">清空</button>
+      </div>
+      <div class="alert info" style="margin-top:14px">
+        生成的是根地址，安装包要按 <span class="mono">&lt;平台&gt;/&lt;文件名&gt;</span> 上传。
+        例如 Android 包放 <span class="mono">android/android-1.2.0.apk</span>。
+        <br>这里只生成地址，不会替你上传文件。密钥也不要填在这里 —— 服务端不保存对象存储密钥。
+      </div>
+    `, { sub: '生成更新包的外部下载前缀' })}
+
+    <div style="height:16px"></div>
+
     <div class="grid cols-2">
       ${card('实时协作', `
         <form id="liveForm">
@@ -1440,6 +1988,27 @@ async function mountSettings() {
       const input = btn.closest('.card').querySelector('input[readonly]');
       try { await navigator.clipboard.writeText(input.value); toast('已复制', 'ok'); }
       catch (err) { toast('复制失败', 'err'); }
+    }
+    if (btn.dataset.act === 'cos-build') {
+      const bucket = String(($('#cosBucket') || {}).value || '').trim();
+      const region = String(($('#cosRegion') || {}).value || '').trim();
+      const cdn = String(($('#cosCdn') || {}).value || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+      let base = '';
+      if (cdn) {
+        base = 'https://' + cdn;
+      } else if (bucket && region) {
+        base = 'https://' + bucket + '.cos.' + region + '.myqcloud.com';
+      }
+      if (!base) { toast('填存储桶和地域，或者填 CDN 域名', 'err'); return; }
+      const target = $('#bizForm [name=cos_base]');
+      if (target) target.value = base;
+      try { await navigator.clipboard.writeText(base); } catch (err) {}
+      toast('已填入并复制，记得点上面的「保存」', 'ok');
+    }
+    if (btn.dataset.act === 'cos-clear') {
+      ['#cosBucket', '#cosCdn'].forEach((sel) => { const el = $(sel); if (el) el.value = ''; });
+      const target = $('#bizForm [name=cos_base]');
+      if (target) target.value = '';
     }
   };
 }

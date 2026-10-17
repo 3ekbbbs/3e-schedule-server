@@ -191,6 +191,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// 授予和取消**共用** POST .../admin 一个端点，body 里用 is_admin 区分 ——
 	// 两者的校验完全一样，拆成两个接口就会出现"改了一处忘了另一处"。
 	mux.HandleFunc("GET /api/admin/users", s.auth(s.handleAdminListUsers))
+	// 账号详情：这个人有哪些日历、多少条日程、从哪些设备登过（2026-10-18）。
+	mux.HandleFunc("GET /api/admin/users/{id}/detail", s.auth(s.handleAdminUserDetail))
 	mux.HandleFunc("POST /api/admin/users/{id}/admin", s.auth(s.handleAdminSetUserAdmin))
 
 	// ---- 账号封禁 / 批量建号（2026-10-09）----
@@ -294,6 +296,34 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/updates/publish", s.auth(s.handleUpdatePublish))
 	mux.HandleFunc("POST /api/device/report", ext(s.handleDeviceReport))
 	mux.HandleFunc("GET /api/devices", s.auth(s.handleDevices))
+
+	// ---------- 分发管理（2026-10-18）----------
+	//
+	// 这一组只管"包发布之后的事"：发不发、说明改不改、删不删、要不要从
+	// 官网克隆一份过来。上传本身还是走上面的 /api/updates/publish。
+	mux.HandleFunc("GET /api/admin/updates", s.auth(s.handleAdminUpdateList))
+	mux.HandleFunc("POST /api/admin/updates/clone", s.auth(s.handleAdminUpdateClone))
+	mux.HandleFunc("POST /api/admin/updates/{platform}/toggle", s.auth(s.handleAdminUpdateToggle))
+	mux.HandleFunc("PUT /api/admin/updates/{platform}", s.auth(s.handleAdminUpdateEdit))
+	mux.HandleFunc("DELETE /api/admin/updates/{platform}", s.auth(s.handleAdminUpdateDelete))
+
+	// ---------- 网络信息（2026-10-18）----------
+	mux.HandleFunc("GET /api/admin/netinfo", s.auth(s.handleNetInfo))
+
+	// ---------- 多服务器联动（2026-10-18）----------
+	//
+	// 账号不参与联动，这里同步的只有"分发关系"：谁跟谁连着、哪类内容走谁。
+	mux.HandleFunc("GET /api/admin/federation/peers", s.auth(s.handleAdminPeers))
+	mux.HandleFunc("POST /api/admin/federation/peers", s.auth(s.handleAdminPeerCreate))
+	mux.HandleFunc("PUT /api/admin/federation/peers/{id}", s.auth(s.handleAdminPeerUpdate))
+	mux.HandleFunc("DELETE /api/admin/federation/peers/{id}", s.auth(s.handleAdminPeerDelete))
+	mux.HandleFunc("POST /api/admin/federation/peers/{id}/test", s.auth(s.handleAdminPeerTest))
+	mux.HandleFunc("GET /api/admin/federation/routes", s.auth(s.handleAdminRoutes))
+	mux.HandleFunc("POST /api/admin/federation/routes", s.auth(s.handleAdminRouteCreate))
+	mux.HandleFunc("PUT /api/admin/federation/routes/{id}", s.auth(s.handleAdminRouteUpdate))
+	mux.HandleFunc("DELETE /api/admin/federation/routes/{id}", s.auth(s.handleAdminRouteDelete))
+	mux.HandleFunc("GET /api/admin/federation/export", s.auth(s.handleAdminFederationExport))
+	mux.HandleFunc("POST /api/admin/federation/import", s.auth(s.handleAdminFederationImport))
 
 	// ---------- plugin distribution（2026-10-08，批次 5）----------
 	//
