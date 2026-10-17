@@ -357,6 +357,7 @@ async function navigate() {
   let page = (location.hash || '#/overview').replace(/^#\//, '');
   if (!PAGE_TITLE[page]) page = 'overview';
   S.page = page;
+  stopLogTimer();
   $('#pageTitle').textContent = PAGE_TITLE[page];
   $$('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.page === page));
   const view = $('#view');
@@ -1303,7 +1304,7 @@ async function renderSettings() {
         <div class="form-grid">
           <div class="field"><label>天气地点</label><input type="text" name="weather_place" value="${esc((loc && loc.place) || c.weather_place || '')}"><span class="hint">下发给客户端显示的默认地点</span></div>
           <div class="field"><label>天气坐标</label>
-            <div class="row"><input type="number" step="0.0001" name="weather_lat" value="${esc((loc && loc.lat) || c.weather_lat || '')}" placeholder="纬度"><input type="number" step="0.0001" name="weather_lon" value="${esc((loc && loc.lon) || c.weather_lon || '')}" placeholder="经度"></div>
+            <div class="row"><input type="number" step="0.0001" name="weather_lat" value="${esc(loc ? loc.lat : (c.weather_lat != null ? c.weather_lat : ''))}" placeholder="纬度"><input type="number" step="0.0001" name="weather_lon" value="${esc(loc ? loc.lon : (c.weather_lon != null ? c.weather_lon : ''))}" placeholder="经度"></div>
           </div>
           <div class="field"><label>更新下载前缀（可选）</label><input type="text" name="cos_base" value="${esc(c.cos_base || '')}" placeholder="https://cdn.example.com/updates"><span class="hint">留空则从本机下载更新包</span></div>
           <div class="field"><label>插件市场地址（可选）</label><input type="text" name="market_url" value="${esc(c.market_url || '')}" placeholder="https://example.com/plugins.html"></div>
